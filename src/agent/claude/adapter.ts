@@ -1,3 +1,4 @@
+import { reapProcessGroup } from '../../platform/process-group';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -87,6 +88,7 @@ export class ClaudeAdapter implements AgentAdapter {
       cwd: opts.cwd,
       env: mergeProcessEnv(process.env, buildLarkChannelEnv(this.larkChannel)),
       stdio: ['pipe', 'pipe', 'pipe'],
+      detached: process.platform !== 'win32',
     }) as ClaudeChild;
 
     log.info('agent', 'spawn', {
@@ -144,6 +146,7 @@ export class ClaudeAdapter implements AgentAdapter {
     return {
       runId: opts.runId,
       events: createEventStream(child, stderrChunks, () => runtimeError),
+      reap: () => reapProcessGroup(child),
       async stop() {
         if (child.exitCode !== null || child.signalCode !== null) return;
         log.info('agent', 'stop-sigterm', { pid: child.pid ?? null, graceMs: stopGraceMs });

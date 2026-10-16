@@ -1,3 +1,4 @@
+import { sessionLifecycle } from '../session/lifecycle';
 import type { AgentCapability } from '../agent/capability';
 import { resolveModelArg } from '../agent/models';
 import type { AgentEvent } from '../agent/types';
@@ -25,6 +26,9 @@ export interface StartRunFlowInput {
   scopeId: string;
   scope: ScopeContext;
   prompt: string;
+  resetPrompt?: string;
+  onReset?: (minutes: number) => Promise<void>;
+  onPreparing?: () => Promise<void>;
   attachments: AgentAttachment[];
   access: AccessDecision;
   capability: AgentCapability;
@@ -110,40 +114,31 @@ export async function startRunFlow(input: StartRunFlowInput): Promise<StartRunFl
     };
   }
 
-  let resumeFrom: string | undefined;
-  let sessionId: string | undefined;
-  let threadId: string | undefined;
-  if (input.sessionCatalog) {
-    const catalogEntry = input.sessionCatalog.activeFor({
-      scopeId: input.scopeId,
-      agentId: input.capability.agentId,
-      cwdRealpath: workspace.cwdRealpath,
-      policyFingerprint: policy.policyFingerprint,
-    });
-    if (catalogEntry?.agentId === 'claude') {
-      sessionId = catalogEntry.sessionId;
-      resumeFrom = sessionId;
-    } else if (catalogEntry?.agentId === 'codex') {
-      threadId = catalogEntry.threadId;
-      resumeFrom = threadId;
-    }
-  }
-  if (!resumeFrom && input.capability.agentId === 'claude') {
-    resumeFrom = input.sessions.resumeFor(input.scopeId, workspace.cwdRealpath);
-    sessionId = resumeFrom;
-    const stale = input.sessions.getRaw(input.scopeId);
-    if (!resumeFrom && stale?.cwd && stale.cwd !== workspace.cwdRealpath) {
-      input.sessions.clear(input.scopeId);
-    }
-  }
-
+  const lifecycle = sessionLifecycle({
+    identity: { scopeId: input.scopeId, agentId: input.capability.agentId,
+      cwdRealpath: workspace.cwdRealpath, policyFingerprint: policy.policyFingerprint },
+    requestedAt: input.now,
+    profileName: input.observability?.profile, chatId: input.scope.chatId, threadId: input.scope.threadId,
+    onWorkspace: async (cwd, prompt) => {
+      const resolved = await resolveWorkingDirectory(cwd);
+      if (!resolved.ok) throw new RunRejected('session-hook-failed', resolved.userVisible);
+      const effective = evaluateRunPolicy({ scope: input.scope, attachments: input.attachments,
+        prompt: prompt ?? input.prompt, requestedCwd, cwdRealpath: resolved.cwdRealpath,
+        access: input.access, capability: input.capability, profileConfig: input.profileConfig,
+        now: Date.now(), codexHome: input.profileConfig.codex?.codexHome,
+        inheritCodexHome: input.profileConfig.codex?.inheritCodexHome });
+      if (!effective.ok) throw new RunRejected('session-hook-failed', effective.rejectReason.userVisible);
+      Object.assign(policy, effective);
+    },
+    profile: input.profileConfig, sessions: input.sessions, catalog: input.sessionCatalog,
+    resetPrompt: input.resetPrompt, onReset: input.onReset, onPreparing: input.onPreparing,
+  });
   let execution: RunExecution;
   try {
     execution = await input.executor.submit({
       scopeId: input.scopeId,
       policy,
-      sessionId,
-      threadId,
+      preparation: lifecycle,
       model: resolveModelArg(
         input.profileConfig.agentKind,
         input.profileConfig.preferences.model,
@@ -165,7 +160,9 @@ export async function startRunFlow(input: StartRunFlowInput): Promise<StartRunFl
         rejectReason: {
           code: err.code,
           userVisible:
-            err.code === 'reconnect-in-progress'
+            err.code === 'session-hook-failed' || err.code === 'run-cancelled'
+              ? err.message
+              : err.code === 'reconnect-in-progress'
               ? '当前 bot 正在重连，稍后会继续处理新消息。'
               : err.code === 'run-already-active'
                 ? '当前会话已有运行在执行，请稍后再试或先停止当前运行。'
@@ -181,8 +178,8 @@ export async function startRunFlow(input: StartRunFlowInput): Promise<StartRunFl
     ok: true,
     execution,
     policy,
-    cwdRealpath: workspace.cwdRealpath,
-    ...(resumeFrom ? { resumeFrom } : {}),
+    cwdRealpath: policy.cwdRealpath,
+    ...(lifecycle.resumeFrom ? { resumeFrom: lifecycle.resumeFrom } : {}),
   };
 }
 

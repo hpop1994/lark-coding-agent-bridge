@@ -1,3 +1,5 @@
+import { SessionHookError } from '../session/hook';
+import type { RunPreparation } from '../session/lifecycle';
 import { randomUUID } from 'node:crypto';
 import type { AgentAdapter, AgentEvent, AgentRun } from '../agent/types';
 import { ActiveRuns, type RunHandle } from '../bot/active-runs';
@@ -17,6 +19,7 @@ export interface RunExecutorDeps {
 
 export interface SubmitRunInput {
   scopeId: string;
+  preparation?: RunPreparation;
   policy: RunPolicyAllow;
   sessionId?: string;
   threadId?: string;
@@ -71,7 +74,8 @@ export class RunExecutor {
         this.activeRuns.newRunsPauseReason() ?? 'new runs are temporarily paused',
       );
     }
-    const releaseScope = this.activeRuns.reserve(input.scopeId);
+    const controller = new AbortController();
+    const releaseScope = this.activeRuns.reserve(input.scopeId, controller);
     if (!releaseScope) {
       throw new RunRejected('run-already-active', 'another run is already active for this scope');
     }
@@ -107,14 +111,25 @@ export class RunExecutor {
     };
     let run: AgentRun;
     try {
+      controller.signal.throwIfAborted();
+      if (input.preparation) Object.assign(runOptions, await input.preparation.prepare(controller.signal));
+      runOptions.prompt = input.policy.prompt;
+      controller.signal.throwIfAborted();
       await this.agent.prepareRun?.(runOptions);
+      controller.signal.throwIfAborted();
     } catch (err) {
+      let cleanupFailure: unknown;
+      try { await input.preparation?.cancel?.(); } catch (cleanupError) { cleanupFailure = cleanupError; log.fail('session', cleanupError, { step: 'prepare-cleanup' }); }
       release();
       releaseScope();
-      if (err instanceof SpawnFailed) throw err;
+      if (cleanupFailure) throw new RunRejected('session-hook-failed', `新会话准备失败：${String(err)}\n结束 hook 同时失败，记录已保留：${String(cleanupFailure)}`);
+      if (err instanceof SessionHookError) throw new RunRejected('session-hook-failed', err.message);
+      if (err instanceof RunRejected || err instanceof SpawnFailed) throw err;
+      if (controller.signal.aborted) throw new RunRejected('run-cancelled', '新会话准备已取消，本轮对话未启动。');
       throw new SpawnFailed('agent prepare failed', err, 'agent-prepare-failed');
     }
     if (this.activeRuns.newRunsPaused()) {
+      await input.preparation?.cancel?.();
       release();
       releaseScope();
       throw new RunRejected(
@@ -125,6 +140,7 @@ export class RunExecutor {
     try {
       run = this.agent.run(runOptions);
     } catch (err) {
+      await input.preparation?.cancel?.();
       release();
       releaseScope();
       throw new SpawnFailed('agent spawn failed', err);
@@ -161,8 +177,6 @@ export class RunExecutor {
     const cleanup = async (waitForExit: boolean): Promise<void> => {
       if (cleaned) return;
       cleaned = true;
-      this.activeRuns.unregister(input.scopeId, run);
-      release();
       if (waitForExit) {
         const exited = await run.waitForExit(this.postDoneExitGraceMs);
         if (!exited) {
@@ -178,8 +192,24 @@ export class RunExecutor {
           });
         }
       }
+      try {
+        await run.reap?.();
+        await input.preparation?.finish();
+      } finally {
+        this.activeRuns.unregister(input.scopeId, run);
+        releaseScope();
+        release();
+      }
     };
-    const fanout = new EventFanout(observeRunEvents(run.events, {
+    const events: AsyncIterable<AgentEvent> = {
+      async *[Symbol.asyncIterator]() {
+        for await (const event of run.events) {
+          input.preparation?.onEvent(event);
+          yield event;
+        }
+      },
+    };
+    const fanout = new EventFanout(observeRunEvents(events, {
       dimensions,
       startedAt,
       now: this.now,
@@ -299,7 +329,8 @@ class EventFanout {
     } catch (err) {
       this.error = err;
     } finally {
-      await this.onDone();
+      try { await this.onDone(); }
+      catch (error) { this.error = error; log.fail('run', error, { step: 'cleanup' }); }
       this.done = true;
       this.wakeAll();
     }

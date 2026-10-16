@@ -37,6 +37,7 @@ import { toast } from "@/components/ui/sonner";
 
 export function ConfigView({ profile }: { profile: string }) {
   const [cfg, setCfg] = useState<ConfigData | null>(null);
+  const [hookText, setHookText] = useState("{}");
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // chat_id → display name, for the allowed-chats list. Seeded from the bot's
@@ -47,6 +48,7 @@ export function ConfigView({ profile }: { profile: string }) {
     apiGet<ConfigData>(`/api/config?profile=${encodeURIComponent(profile)}`)
       .then((c) => {
         setCfg(c);
+        setHookText(JSON.stringify(c.hooks ?? {}, null, 2));
         setError(null);
       })
       .catch((e) => setError(String(e.message ?? e)));
@@ -84,6 +86,8 @@ export function ConfigView({ profile }: { profile: string }) {
         cotMessages: cfg.cotMessages,
         maxConcurrentRuns: cfg.maxConcurrentRuns,
         runIdleTimeoutMinutes: cfg.runIdleTimeoutMinutes,
+        sessionAutoResetMinutes: cfg.sessionAutoResetMinutes,
+        hooks: JSON.parse(hookText),
         requireMentionInGroup: cfg.requireMentionInGroup,
         larkCliIdentity: cfg.larkCliIdentity,
       });
@@ -166,6 +170,15 @@ export function ConfigView({ profile }: { profile: string }) {
                 onChange={(e) => set("runIdleTimeoutMinutes", Number(e.target.value))} />
             </Field>
           </div>
+          <Field label="会话空闲重置（分钟，0=关闭，默认15）">
+            <Input type="number" min={0} max={525600} value={cfg.sessionAutoResetMinutes}
+              onChange={(e) => set("sessionAutoResetMinutes", Number(e.target.value))} />
+          </Field>
+          <Field label="新会话 Hook（JSON，{}=关闭）">
+            <textarea className="w-full min-h-36 rounded border p-2 font-mono text-sm"
+              value={hookText} onChange={(e) => setHookText(e.target.value)} />
+            <p className="text-xs text-muted-foreground">beforeSessionStart / afterSessionEnd 支持 command、args、cwd、timeoutMs；失败阻断对话。配置 Hook 时并发上限须为 1。</p>
+          </Field>
           <ToggleRow label="群里需要 @ bot（全局默认）"
             hint="关闭后群里任何消息都会触发（需 im:message.group_msg 权限）。可在下方「允许响应的群」为单个群单独设置，优先级高于此项。"
             checked={cfg.requireMentionInGroup} onChange={(v) => set("requireMentionInGroup", v)} />

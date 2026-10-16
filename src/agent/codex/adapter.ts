@@ -1,3 +1,4 @@
+import { reapProcessGroup } from '../../platform/process-group';
 import { createInterface } from 'node:readline';
 import type { Readable, Writable } from 'node:stream';
 import { join } from 'node:path';
@@ -112,6 +113,7 @@ export class CodexAdapter implements AgentAdapter {
       cwd: opts.cwd,
       env: mergeProcessEnv(process.env, envOverrides),
       stdio: ['pipe', 'pipe', 'pipe'],
+      detached: process.platform !== 'win32',
     }) as CodexChild;
 
     log.info('agent', 'spawn', {
@@ -160,6 +162,7 @@ export class CodexAdapter implements AgentAdapter {
     return {
       runId: opts.runId,
       events: createEventStream(child, stderrChunks, () => runtimeError, () => stopReason),
+      reap: () => reapProcessGroup(child),
       async stop() {
         if (child.exitCode !== null || child.signalCode !== null) return;
         stopReason = 'interrupted';

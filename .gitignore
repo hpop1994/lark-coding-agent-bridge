@@ -22,3 +22,6 @@ web/dist/
 scripts/
 CHANGELOG.md
 tests-smoke/
+
+# Local deployment staging and verification output
+temp/

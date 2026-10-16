@@ -1,3 +1,4 @@
+import { validateSessionSettings, type SessionHooks } from './session-lifecycle';
 import { dirname } from 'node:path';
 import { resolveAppPaths } from './app-paths';
 import { setSecret } from './keystore';
@@ -167,7 +168,9 @@ export async function savePreferencesConfig(
   mode: ProfileMode,
   /** In-meeting agent settings; omitted by callers that don't edit them. */
   meeting?: ProfileConfig['meeting'],
+  hooks?: SessionHooks,
 ): Promise<void> {
+  validateSessionSettings(preferences.sessionAutoResetMinutes, hooks ?? state.profileConfig.hooks ?? {}, preferences.maxConcurrentRuns ?? 10);
   const larkCli = {
     identityPreset: larkCliIdentity,
     localUserImport: {
@@ -183,6 +186,7 @@ export async function savePreferencesConfig(
       state.profileConfig.larkCli = larkCli;
       state.profileConfig.mode = mode;
       if (meeting) state.profileConfig.meeting = meeting;
+      if (hooks) { state.profileConfig.hooks = hooks; (state.cfg as typeof state.cfg & { hooks: SessionHooks }).hooks = hooks; }
       await saveConfig(state.cfg, state.configPath);
       return;
     }
@@ -202,6 +206,7 @@ export async function savePreferencesConfig(
         requireMentionInGroup,
       },
       ...(meeting ? { meeting } : {}),
+      ...(hooks ? { hooks } : {}),
       larkCli,
     };
     await saveRootConfig(root, state.configPath);

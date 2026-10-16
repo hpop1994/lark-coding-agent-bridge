@@ -354,3 +354,7 @@ export default createAdapter;
 [MIT](./LICENSE)
 
 <img src="./assets/feedback-group-qr.png" alt="飞书反馈群二维码" width="360">
+
+## 会话空闲重置与生命周期 Hook
+
+会话默认空闲 15 分钟后重置，可在 Web 设置页或 `/config` 修改，0 关闭。支持 `beforeSessionStart` 与 `afterSessionEnd` 通用 Hook；脚本可交付独立工作目录及私有 state，Bridge 负责续聊绑定、超时、取消、定时结束与日志。详见[协议和失败语义](docs/session-hooks.md)。

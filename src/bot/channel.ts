@@ -1,3 +1,4 @@
+import { sessionAutoResetMinutes } from '../config/session-lifecycle';
 import type {
   LarkChannel,
   LarkChannelOptions,
@@ -183,6 +184,7 @@ export interface StartChannelDeps {
 
 export async function startChannel(deps: StartChannelDeps): Promise<BridgeChannel> {
   const { cfg, agent, sessions, sessionCatalog, workspaces, controls } = deps;
+  sessionCatalog?.resources.start();
   const activeRuns = new ActiveRuns();
   // ChatModeCache stays per-bridge-instance — invalidated on restart along
   // with everything else. Topic-mode chats only need one chat.get() call ever.
@@ -322,12 +324,49 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
         });
       } catch (err) {
         log.fail('flush', err);
+        await channel.send(firstMsg.chatId, { markdown: `本轮执行失败，未继续处理：${err instanceof Error ? err.message : String(err)}` },
+          { replyTo: firstMsg.messageId, ...(firstMsg.threadId ? { replyInThread: true } : {}) }).catch((error) => log.fail('outbound', error, { step: 'failure-notice' }));
       } finally {
         pending.unblock(scope);
         log.info('flush', 'end');
       }
     });
   });
+
+  let sweeping = false;
+  const sweepSessions = async (): Promise<void> => {
+    if (sweeping || activeRuns.newRunsPaused() || !sessionCatalog) return;
+    sweeping = true;
+    try {
+      await sessionCatalog.resources.sweep({
+        minutes: sessionAutoResetMinutes(controls.cfg.preferences?.sessionAutoResetMinutes), now: Date.now(),
+        isPending: (scope) => pending.has(scope) || activeRuns.scopes().includes(scope),
+        acquire: (scope) => {
+          const releaseScope = activeRuns.reserve(scope);
+          if (!releaseScope) return undefined;
+          const releasePool = pool.tryAcquire();
+          if (!releasePool) { releaseScope(); return undefined; }
+          return () => { releasePool(); releaseScope(); };
+        },
+        onEnded: async (entry) => {
+          sessionCatalog.archiveActive({ scopeId: entry.scopeId, agentId: entry.agentId as 'claude' | 'codex',
+            cwdRealpath: entry.baseCwd, policyFingerprint: entry.fingerprint });
+          sessions.clear(entry.scopeId);
+          await sessionCatalog.flush(); await sessions.flush();
+        },
+        onError: async (entry, error) => {
+          if (entry.chatId) await channel.send(entry.chatId,
+            { markdown: `会话结束 hook 失败，资源记录已保留；本会话下次启动前必须先处理成功。\n${String(error)}` },
+            entry.threadId ? { replyTo: entry.threadId, replyInThread: true } : undefined);
+        },
+      });
+    } catch (error) { log.fail('session', error, { step: 'sweep' }); }
+    finally { sweeping = false; }
+  };
+  let sweepDone: Promise<void> = Promise.resolve();
+  const sessionTimer = setInterval(() => { if (!sweeping) sweepDone = sweepSessions(); }, 60000);
+  sessionTimer.unref();
+  log.info('session', 'sweeper-started', { profile: controls.profile, intervalMs: 60000, minutes: sessionAutoResetMinutes(controls.cfg.preferences?.sessionAutoResetMinutes) });
 
   // Counter for stdout reconnect escalation; reset on `reconnected`.
   let consecutiveReconnects = 0;
@@ -491,6 +530,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
     appId: cfg.accounts.app.id,
     procId: controls.processId,
   });
+  sweepDone = sweepSessions();
   console.log('正在监听消息。按 Ctrl+C 退出。\n');
 
   // App-level keepalive: 15s probe + wake-up detection + HTTP reachability.
@@ -510,6 +550,9 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
     channel,
     disconnect: async () => {
       activeRuns.pauseNewRuns('bridge-disconnect');
+      clearInterval(sessionTimer);
+      sessionCatalog?.resources.stop();
+      await sweepDone;
       ownerRefresh.stop();
       knownChatsRefresh.stop();
       keepalive.stop();
@@ -878,7 +921,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   // the user is pointing at. An already-engaged topic keeps that history in its
   // resumed session, so we skip the fetch there.
   let topicContext: QuotedContext[] = [];
-  if (mode === 'topic' && threadId && !sessions.getRaw(scope)) {
+  if (mode === 'topic' && threadId && !sessions.getRaw(scope) && !sessionCatalog?.entries().some((entry) => entry.scopeId === scope)) {
     const exclude = new Set([...batchIds, ...quoteTargets]);
     topicContext = await fetchTopicContext(channel, threadId, {
       maxMessages: 40,
@@ -963,6 +1006,13 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     scopeId: scope,
     scope: scopeContext,
     prompt,
+    resetPrompt: buildPrompt(batch, attachments, quotes, [], channel.botIdentity, extraInstructions),
+    onReset: async (minutes) => {
+      await channel.send(chatId, { markdown: `会话已空闲超过 ${minutes} 分钟，已开始新会话。` }, sendOpts);
+    },
+    onPreparing: async () => {
+      await channel.send(chatId, { markdown: '正在执行新会话准备脚本…' }, sendOpts);
+    },
     attachments: attachments.map(toPolicyAttachment),
     access: accessDecision,
     capability,
@@ -1001,14 +1051,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     log.info('session', 'fresh', { cwd });
   }
   const recordSession = (evt: AgentEvent): void => {
-    recordRunSessionEvent({
-      scopeId: scope,
-      sessions,
-      sessionCatalog,
-      capability,
-      policy: flow.policy,
-      event: evt,
-    });
+
     if (evt.type === 'system' && evt.sessionId) {
       log.info('session', 'set', { sessionId: evt.sessionId });
     }

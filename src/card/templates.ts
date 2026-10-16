@@ -62,6 +62,8 @@ export function workspacesCard(current: string | undefined, named: Record<string
 }
 
 export interface StatusInfo {
+  sessionAutoResetMinutes?: number;
+  sessionHook?: boolean;
   profileName: string;
   cwd?: string;
   sessionId?: string;
@@ -103,6 +105,8 @@ export function statusCard(info: StatusInfo): object {
     `🧩 **profile**: ${escapeMd(info.profileName)}`,
     `📁 **cwd**: ${cwdLine}`,
     `🔗 **session**: ${sessionLine}`,
+    `⏳ **会话空闲重置**: ${info.sessionAutoResetMinutes === 0 ? '关闭' : `${info.sessionAutoResetMinutes ?? 15} 分钟`}`,
+    `🪝 **新会话 Hook**: ${info.sessionHook ? '已配置' : '未配置'}`,
     `🤖 **agent**: ${escapeMd(info.agentName)}`,
     `🛡 **${escapeMd(info.runtimeAccess.label)}**: ${escapeMd(info.runtimeAccess.value)}`,
     ...(info.larkCliStatus ? [`🔐 **lark-cli**: ${info.larkCliStatus}`] : []),

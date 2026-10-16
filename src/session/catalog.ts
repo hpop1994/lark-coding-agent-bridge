@@ -1,3 +1,4 @@
+import { SessionResources } from './resources';
 import { randomUUID } from 'node:crypto';
 import { open, readFile, rename, mkdir } from 'node:fs/promises';
 import { dirname } from 'node:path';
@@ -19,6 +20,7 @@ export interface SessionCatalogEntry extends SessionCatalogIdentity {
   key: string;
   status: SessionCatalogStatus;
   updatedAt: number;
+  lastCompletedAt?: number;
   sessionId?: string;
   threadId?: string;
   lastSummary?: string;
@@ -61,11 +63,14 @@ export class SessionCatalog {
   private saving: Promise<void> = Promise.resolve();
   private readonly path: string;
 
+  readonly resources: SessionResources;
   constructor(path = `${paths.sessionsFile}.catalog.json`) {
     this.path = path;
+    this.resources = new SessionResources(`${path}.resources.json`);
   }
 
   async load(): Promise<void> {
+    await this.resources.load();
     try {
       const raw = JSON.parse(await readFile(this.path, 'utf8')) as unknown;
       if (!Array.isArray(raw)) {
@@ -132,6 +137,14 @@ export class SessionCatalog {
     return true;
   }
 
+  complete(input: SessionCatalogIdentity, session: string, now: number): void {
+    const key = sessionCatalogKey(input);
+    const entry = this.data.get(key);
+    if (!entry || entry.status !== 'active' || (entry.sessionId ?? entry.threadId) !== session) return;
+    this.data.set(key, { ...entry, lastCompletedAt: now, updatedAt: now });
+    this.schedulePersist();
+  }
+
   entries(): SessionCatalogEntry[] {
     return [...this.data.values()].map((entry) => ({ ...entry }));
   }
@@ -167,6 +180,7 @@ export class SessionCatalog {
 
   async flush(): Promise<void> {
     await this.saving;
+    await this.resources.flush();
   }
 
   async replaceForTest(entries: SessionCatalogEntry[]): Promise<void> {
@@ -230,6 +244,7 @@ function normalizeEntry(input: unknown): SessionCatalogEntry | undefined {
     policyFingerprint: raw.policyFingerprint,
     status: raw.status,
     updatedAt: raw.updatedAt,
+    ...(typeof raw.lastCompletedAt === 'number' ? { lastCompletedAt: raw.lastCompletedAt } : {}),
     ...(typeof raw.sessionId === 'string' ? { sessionId: raw.sessionId } : {}),
     ...(typeof raw.threadId === 'string' ? { threadId: raw.threadId } : {}),
     ...(typeof raw.lastSummary === 'string' ? { lastSummary: raw.lastSummary } : {}),

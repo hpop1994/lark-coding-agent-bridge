@@ -1,3 +1,4 @@
+import { SessionCatalog } from '../../../src/session/catalog';
 import type { NormalizedMessage } from '@larksuite/channel';
 import { realpath } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -82,6 +83,22 @@ afterEach(async () => {
 });
 
 describe('markdown stream startup failures', () => {
+  it('blocks AI and sends hook failure output to the originating Feishu conversation', async () => {
+    const h = await createHarness();
+    h.profileConfig.preferences.maxConcurrentRuns = 1;
+    h.profileConfig.hooks = { beforeSessionStart: { command: process.execPath,
+      args: ['-e', "console.error('QA_SYNC_FAILURE');process.exit(7)"], timeoutMs: 3000 } };
+    const catalog = new SessionCatalog(join(h.tmp.profile, 'catalog.json')); await catalog.load();
+    await startTestBridge({ ...h, sessionCatalog: catalog });
+    await h.channel.handlers.message?.(message('om_hook_failure', 'question'));
+    await waitFor(() => h.channel.sent.some((entry) => JSON.stringify(entry.content).includes('QA_SYNC_FAILURE')));
+    expect(h.agent.runOptions).toHaveLength(0);
+    expect(JSON.stringify(h.channel.sent)).toContain('已阻断');
+    const delivered = h.channel.sent.find((entry) => JSON.stringify(entry.content).includes('QA_SYNC_FAILURE'));
+    expect(delivered?.options).toMatchObject({ replyTo: 'om_hook_failure' });
+    await catalog.flush();
+  });
+
   it('does not leave the IM queue blocked when the agent exits before stream producer starts', async () => {
     const h = await createHarness();
     await startTestBridge(h);
@@ -508,6 +525,7 @@ async function createHarness(options: {
 }
 
 async function startTestBridge(h: {
+  sessionCatalog?: SessionCatalog;
   profileConfig: ReturnType<typeof createDefaultProfileConfig>;
   agent: FakeAgentAdapter;
   sessions: SessionStore;
@@ -518,6 +536,7 @@ async function startTestBridge(h: {
     cfg: h.profileConfig,
     agent: h.agent,
     sessions: h.sessions,
+    sessionCatalog: h.sessionCatalog,
     workspaces: h.workspaces,
     controls: h.controls,
   });

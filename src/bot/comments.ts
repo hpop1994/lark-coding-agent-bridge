@@ -1,3 +1,4 @@
+import { sessionLifecycle } from '../session/lifecycle';
 import { randomUUID } from 'node:crypto';
 import { mkdir } from 'node:fs/promises';
 import { dirname } from 'node:path';
@@ -8,7 +9,7 @@ import { getAgentStopGraceMs } from '../config/schema';
 import type { Controls } from '../commands';
 import { resolveAppPaths } from '../config/app-paths';
 import { log } from '../core/logger';
-import { evaluateRunPolicy } from '../policy/run-policy';
+import { evaluateRunPolicy, type RunPolicyInput } from '../policy/run-policy';
 import { resolveWorkingDirectory } from '../policy/workspace';
 import { RunRejected } from '../runtime/errors';
 import type { ActiveRuns } from './active-runs';
@@ -196,7 +197,7 @@ export async function handleCommentMention(deps: CommentDeps): Promise<void> {
     if (typeof commentTimeoutMs === 'number') {
       log.info('comment', 'timeout-watchdog', { commentScopeId: runScopeId, timeoutMs: commentTimeoutMs });
     }
-    const policy = evaluateRunPolicy({
+    const policyInput: RunPolicyInput = {
       scope: {
         source: 'comment',
         actorId: evt.operator.openId,
@@ -214,7 +215,8 @@ export async function handleCommentMention(deps: CommentDeps): Promise<void> {
       codexHome: controls.profileConfig.codex?.codexHome,
       inheritCodexHome: controls.profileConfig.codex?.inheritCodexHome,
       ...(typeof commentTimeoutMs === 'number' ? { ttlMs: commentTimeoutMs } : {}),
-    });
+    };
+    const policy = evaluateRunPolicy(policyInput);
     if (!policy.ok) {
       log.warn('policy', 'denied', {
         scope: runScopeId,
@@ -256,9 +258,22 @@ export async function handleCommentMention(deps: CommentDeps): Promise<void> {
         cwd: cwdRealpath,
       });
 
+      const preparation = sessionCatalog && (controls.profileConfig.hooks?.beforeSessionStart || controls.profileConfig.hooks?.afterSessionEnd)
+        ? sessionLifecycle({ identity: { scopeId: agentSessionScopeId, agentId: capability.agentId,
+            cwdRealpath, policyFingerprint: policy.policyFingerprint }, profile: controls.profileConfig,
+            sessions, catalog: sessionCatalog, requestedAt: Date.now(), profileName: controls.profile,
+            onWorkspace: async (cwd) => {
+              const resolved = await resolveWorkingDirectory(cwd);
+              if (!resolved.ok) throw new RunRejected('session-hook-failed', resolved.userVisible);
+              const effective = evaluateRunPolicy({ ...policyInput, cwdRealpath: resolved.cwdRealpath, now: Date.now() });
+              if (!effective.ok) throw new RunRejected('session-hook-failed', effective.rejectReason.userVisible);
+              Object.assign(policy, effective);
+            } })
+        : undefined;
       const execution = await deps.executor.submit({
         scopeId: runScopeId,
         policy,
+        preparation,
         sessionId,
         threadId,
         stopGraceMs: getAgentStopGraceMs(controls.cfg),
@@ -274,7 +289,7 @@ export async function handleCommentMention(deps: CommentDeps): Promise<void> {
             reason: err.code,
             commentScopeId: runScopeId,
           });
-          const reply = commentRunRejectedReply(err.code);
+          const reply = err.code === 'session-hook-failed' || err.code === 'run-cancelled' ? err.message : commentRunRejectedReply(err.code);
           if (reply) {
             await postCommentReply(channel, target, evt, reply, { isWhole: ctx.isWhole }).catch((replyErr) => {
               log.fail('comment', replyErr, { step: 'postRunRejectedReply' });
@@ -320,7 +335,7 @@ export async function handleCommentMention(deps: CommentDeps): Promise<void> {
             break;
           }
           const e = next.value;
-          recordCommentSessionEvent({
+          if (!preparation) recordCommentSessionEvent({
             scopeId: agentSessionScopeId,
             sessions,
             sessionCatalog,
@@ -328,7 +343,7 @@ export async function handleCommentMention(deps: CommentDeps): Promise<void> {
             policy,
             event: e,
           });
-          if (capability.agentId === 'claude' && e.type === 'system' && e.sessionId) {
+          if (!preparation && capability.agentId === 'claude' && e.type === 'system' && e.sessionId) {
             sessions.set(docSessionScopeId, e.sessionId, policy.cwdRealpath);
           }
           switch (e.type) {

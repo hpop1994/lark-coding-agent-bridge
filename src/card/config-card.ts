@@ -1,3 +1,4 @@
+import type { SessionHooks } from '../config/session-lifecycle';
 import { modelLabel, supportedModels } from '../agent/models';
 import type { KnownChat } from '../bot/lark-info';
 import type { AgentKind, LarkCliIdentityPreset, ProfileMode } from '../config/profile-schema';
@@ -16,6 +17,8 @@ export interface ConfigFormOpts {
   maxConcurrentRuns: number;
   /** 0 means "disabled". */
   runIdleTimeoutMinutes: number;
+  sessionAutoResetMinutes?: number;
+  hooks?: SessionHooks;
   requireMentionInGroup: boolean;
   larkCliIdentity: LarkCliIdentityPreset;
   allowedUsers: string[];
@@ -252,6 +255,14 @@ export function configFormCard(opts: ConfigFormOpts): object {
               placeholder: { tag: 'plain_text', content: '0' },
               input_type: 'text',
             },
+            {
+              tag: 'markdown',
+              content: '**会话空闲重置（分钟）**\n上一轮结束后计时，下一次请求到来时检查。默认15，0关闭。',
+            },
+            { tag: 'input', name: 'session_auto_reset_minutes',
+              default_value: String(opts.sessionAutoResetMinutes ?? 15), input_type: 'text' },
+            { tag: 'markdown', content: '**新会话 Hook（JSON）**\nbeforeSessionStart / afterSessionEnd 支持 command、args、cwd、timeoutMs。填写 {} 关闭。' },
+            { tag: 'input', name: 'session_hooks', default_value: JSON.stringify(opts.hooks ?? {}), input_type: 'text' },
             {
               tag: 'markdown',
               content:

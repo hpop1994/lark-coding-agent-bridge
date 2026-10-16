@@ -46,6 +46,8 @@ export interface ConfigView {
   cotMessages: CotMessages;
   maxConcurrentRuns: number;
   runIdleTimeoutMinutes: number;
+  sessionAutoResetMinutes: number;
+  hooks: { beforeSessionStart?: { command: string; args: string[]; cwd?: string; timeoutMs: number } };
   requireMentionInGroup: boolean;
   larkCliIdentity: LarkCliIdentity;
   meeting: MeetingConfig;

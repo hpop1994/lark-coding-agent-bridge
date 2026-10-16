@@ -1,3 +1,4 @@
+import { parseSessionHooks, sessionAutoResetMinutes, validateSessionSettings, type SessionHooks } from '../config/session-lifecycle';
 import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
@@ -331,6 +332,7 @@ async function handleNew(args: string, ctx: CommandContext): Promise<void> {
     return handleNewChat(rawName, ctx);
   }
 
+  ctx.sessionCatalog?.resources.requestEnd(ctx.scope, 'manual_reset');
   const wasRunning = ctx.activeRuns.interrupt(ctx.scope);
   if (ctx.sessionCatalog && ctx.sessionCatalogIdentity) {
     ctx.sessionCatalog.archiveActive({
@@ -534,6 +536,10 @@ function listScopedWorkspaces(ctx: CommandContext): Record<string, string> {
 }
 
 async function handleResume(args: string, ctx: CommandContext): Promise<void> {
+  if (ctx.controls.profileConfig.hooks?.afterSessionEnd) {
+    await reply(ctx, '此 profile 使用独立会话工作区。请继续当前会话，或用 /new 开始新会话；已结束的旧会话不能直接恢复。');
+    return;
+  }
   const parts = args.trim().split(/\s+/).filter(Boolean);
   const sub = parts[0] ?? '';
   const rest = parts.slice(1).join(' ').trim();
@@ -819,7 +825,7 @@ async function handleStatus(_args: string, ctx: CommandContext): Promise<void> {
       : undefined;
   const card = statusCard({
     profileName: ctx.controls.profile,
-    cwd,
+    cwd: ctx.sessionCatalog?.resources.get(ctx.scope)?.phase === 'active' ? ctx.sessionCatalog.resources.get(ctx.scope)?.cwd : cwd,
     sessionId: isCodex ? catalogEntry?.threadId : sess?.sessionId,
     emptySessionText: isCodex ? '(未建立)' : undefined,
     sessionStale: !isCodex && Boolean(cwd && sess && sess.cwd !== cwd),
@@ -833,6 +839,8 @@ async function handleStatus(_args: string, ctx: CommandContext): Promise<void> {
     ownerState: formatOwnerState(ctx),
     scope: ctx.scope,
     chatMode: ctx.chatMode,
+    sessionAutoResetMinutes: sessionAutoResetMinutes(ctx.controls.cfg.preferences?.sessionAutoResetMinutes),
+    sessionHook: Boolean(ctx.controls.profileConfig.hooks?.beforeSessionStart),
   });
   await ctx.channel.send(ctx.msg.chatId, { card }, commandReplyOptions(ctx));
 }
@@ -1749,6 +1757,8 @@ async function showConfigForm(ctx: CommandContext): Promise<void> {
     cotMessages: getCotMessages(ctx.controls.cfg),
     maxConcurrentRuns: getMaxConcurrentRuns(ctx.controls.cfg),
     runIdleTimeoutMinutes: ms ? Math.round(ms / 60_000) : 0,
+    sessionAutoResetMinutes: sessionAutoResetMinutes(ctx.controls.cfg.preferences?.sessionAutoResetMinutes),
+    hooks: ctx.controls.profileConfig.hooks ?? {},
     requireMentionInGroup: getRequireMentionInGroup(ctx.controls.cfg),
     larkCliIdentity: ctx.controls.profileConfig.larkCli.identityPreset,
     allowedUsers: access.allowedUsers,
@@ -1791,6 +1801,14 @@ async function cancelConfig(ctx: CommandContext): Promise<void> {
 
 async function submitConfig(ctx: CommandContext): Promise<void> {
   const fv = ctx.formValue ?? {};
+  let resetMinutes: number;
+  let hooks: SessionHooks;
+  try {
+    const reset = String(fv.session_auto_reset_minutes ?? '').trim();
+    resetMinutes = sessionAutoResetMinutes(reset === '' ? ctx.controls.cfg.preferences?.sessionAutoResetMinutes : Number(reset));
+    const rawHooks = String(fv.session_hooks ?? '').trim();
+    hooks = parseSessionHooks(rawHooks ? JSON.parse(rawHooks) : ctx.controls.profileConfig.hooks);
+  } catch (err) { await reply(ctx, `配置无效：${String(err)}`); return; }
   const rawReply = String(fv.message_reply ?? '').trim();
   const messageReply: MessageReplyMode =
     rawReply === 'markdown' || rawReply === 'text' || rawReply === 'card'
@@ -1824,6 +1842,8 @@ async function submitConfig(ctx: CommandContext): Promise<void> {
     Number.isFinite(parsedMaxCC) && parsedMaxCC >= 1
       ? Math.min(50, Math.floor(parsedMaxCC))
       : getMaxConcurrentRuns(ctx.controls.cfg);
+  try { validateSessionSettings(resetMinutes, hooks, maxConcurrentRuns); }
+  catch (error) { await reply(ctx, `配置无效：${String(error)}`); return; }
   // Parse run_idle_timeout_minutes. 0 disables; otherwise clamp 1-120.
   // Empty string keeps current value.
   const rawIdle = String(fv.run_idle_timeout_minutes ?? '').trim();
@@ -1897,6 +1917,7 @@ async function submitConfig(ctx: CommandContext): Promise<void> {
       cotMessages,
       maxConcurrentRuns,
       runIdleTimeoutMinutes,
+      sessionAutoResetMinutes: resetMinutes,
       requireMentionInGroup,
     };
 
@@ -1912,7 +1933,7 @@ async function submitConfig(ctx: CommandContext): Promise<void> {
         larkCliPolicyApplied = true;
         failureStep = 'config.save';
       }
-      await savePreferencesConfig(ctx, nextPreferences, requireMentionInGroup, larkCliIdentity, mode);
+      await savePreferencesConfig(ctx, nextPreferences, requireMentionInGroup, larkCliIdentity, mode, hooks);
     } catch (err) {
       let rollbackFailed = false;
       if (larkCliIdentityChanged) {
@@ -2073,6 +2094,7 @@ async function savePreferencesConfig(
   requireMentionInGroup: boolean,
   larkCliIdentity: ProfileConfig['larkCli']['identityPreset'],
   mode: ProfileMode,
+  hooks?: SessionHooks,
 ): Promise<void> {
   return configOps.savePreferencesConfig(
     ctx.controls,
@@ -2080,6 +2102,8 @@ async function savePreferencesConfig(
     requireMentionInGroup,
     larkCliIdentity,
     mode,
+    undefined,
+    hooks,
   );
 }
 

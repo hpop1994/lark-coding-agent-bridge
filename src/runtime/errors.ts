@@ -1,6 +1,8 @@
 import type { AgentPreflightDiagnostic, AgentPreflightErrorCode } from '../agent/preflight';
 
 export type RunRejectedCode =
+  | 'run-cancelled'
+  | 'session-hook-failed'
   | 'pool-full'
   | 'policy-expired'
   | 'reconnect-in-progress'

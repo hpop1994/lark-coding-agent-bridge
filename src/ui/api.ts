@@ -1,3 +1,4 @@
+import { parseSessionHooks, sessionAutoResetMinutes, validateSessionSettings, type SessionHooks } from '../config/session-lifecycle';
 import type { LarkChannel } from '@larksuite/channel';
 import { fetchKnownChats } from '../bot/lark-info';
 import {
@@ -61,6 +62,8 @@ export interface ConfigView {
   cotMessages: CotMessagesMode;
   maxConcurrentRuns: number;
   runIdleTimeoutMinutes: number;
+  sessionAutoResetMinutes: number;
+  hooks: SessionHooks;
   requireMentionInGroup: boolean;
   larkCliIdentity: LarkCliIdentityPreset;
   meeting: MeetingConfig;
@@ -90,6 +93,8 @@ export function buildConfigView(state: MutableProfileState, live = false): Confi
     cotMessages: getCotMessages(state.cfg),
     maxConcurrentRuns: getMaxConcurrentRuns(state.cfg),
     runIdleTimeoutMinutes: ms ? Math.round(ms / 60_000) : 0,
+    sessionAutoResetMinutes: sessionAutoResetMinutes(state.cfg.preferences?.sessionAutoResetMinutes),
+    hooks: state.profileConfig.hooks ?? {},
     requireMentionInGroup: getRequireMentionInGroup(state.cfg),
     larkCliIdentity: state.profileConfig.larkCli.identityPreset,
     meeting: state.profileConfig.meeting,
@@ -186,6 +191,7 @@ function parseMeetingBody(body: unknown, current: MeetingConfig): MeetingConfig 
 }
 
 interface ParsedConfig {
+  hooks: SessionHooks;
   mode: ProfileMode;
   meeting: MeetingConfig;
   larkCliIdentity: LarkCliIdentityPreset;
@@ -203,6 +209,12 @@ interface ParsedConfig {
  */
 function parseConfigBody(state: MutableProfileState, body: unknown): ParsedConfig {
   const fv = asRecord(body);
+  let resetMinutes: number;
+  let hooks: SessionHooks;
+  try {
+    resetMinutes = sessionAutoResetMinutes(fv.sessionAutoResetMinutes === undefined ? state.cfg.preferences?.sessionAutoResetMinutes : fv.sessionAutoResetMinutes);
+    hooks = parseSessionHooks(fv.hooks === undefined ? state.profileConfig.hooks : fv.hooks);
+  } catch (err) { throw new ApiError(400, String(err)); }
   const agentKind = state.profileConfig.agentKind;
 
   const mode: ProfileMode =
@@ -234,6 +246,8 @@ function parseConfigBody(state: MutableProfileState, body: unknown): ParsedConfi
       ? getMaxConcurrentRuns(state.cfg)
       : clampInt(fv.maxConcurrentRuns, 1, 50, getMaxConcurrentRuns(state.cfg));
 
+  try { validateSessionSettings(resetMinutes, hooks, maxConcurrentRuns); }
+  catch (error) { throw new ApiError(400, String(error)); }
   const currentIdleMs = getRunIdleTimeoutMs(state.cfg);
   const currentIdleMinutes = currentIdleMs ? Math.round(currentIdleMs / 60_000) : 0;
   let runIdleTimeoutMinutes: number;
@@ -263,6 +277,7 @@ function parseConfigBody(state: MutableProfileState, body: unknown): ParsedConfi
     nextEffectiveIdentity,
     previousEffectiveIdentity,
     identityChanged: nextEffectiveIdentity !== previousEffectiveIdentity,
+    hooks,
     nextPreferences: {
       ...(state.cfg.preferences ?? {}),
       model,
@@ -272,6 +287,7 @@ function parseConfigBody(state: MutableProfileState, body: unknown): ParsedConfi
       cotMessages,
       maxConcurrentRuns,
       runIdleTimeoutMinutes,
+      sessionAutoResetMinutes: resetMinutes,
     },
   };
 }
@@ -297,6 +313,7 @@ export async function applyConfig(rt: UiRuntime, body: unknown): Promise<ConfigV
       p.larkCliIdentity,
       p.mode,
       p.meeting,
+      p.hooks,
     );
   } catch (err) {
     if (identityApplied) {
@@ -331,6 +348,7 @@ export async function applyConfigToDisk(
       p.larkCliIdentity,
       p.mode,
       p.meeting,
+      p.hooks,
     );
   } catch (err) {
     throw new ApiError(500, `保存失败：${err instanceof Error ? err.message : String(err)}`);

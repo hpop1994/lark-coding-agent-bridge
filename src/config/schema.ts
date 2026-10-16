@@ -134,6 +134,8 @@ export interface AppPreferences {
    * can hang indefinitely). Per-scope `/timeout` overrides this.
    */
   runIdleTimeoutMinutes?: number;
+  /** New requests reset completed sessions after this idle period; 0 disables. Default 15. */
+  sessionAutoResetMinutes?: number;
   /**
    * Whether the bot only responds to messages that @-mention it in groups
    * (regular and topic groups). p2p is always unrestricted. Default true:

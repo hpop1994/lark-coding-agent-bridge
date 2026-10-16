@@ -354,3 +354,7 @@ A missing module, a bad factory, or a throwing adapter all degrade to noop — t
 [MIT](./LICENSE)
 
 <img src="./assets/feedback-group-qr.png" alt="Feedback group QR code" width="360">
+
+## Session lifecycle hooks
+
+Sessions reset after 15 idle minutes by default (0 disables). Configure the per-profile timeout and `beforeSessionStart` / `afterSessionEnd` commands through the web console or `/config`. Hooks may supply a persistent session workspace and opaque state; the bridge owns lifecycle, cancellation, failure delivery, and logging. See [the lifecycle contract](docs/session-hooks.md).

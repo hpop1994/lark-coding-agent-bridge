@@ -1,3 +1,4 @@
+import { parseSessionHooks, validateSessionSettings, type SessionHooks } from './session-lifecycle';
 import type {
   AppCredentials,
   AppPreferences,
@@ -144,6 +145,7 @@ export interface LarkCliConfig {
 
 export interface ProfileConfig {
   schemaVersion: 2;
+  hooks?: SessionHooks;
   agentKind: AgentKind;
   /** Deployment mode switch. Default 'personal'. See {@link ProfileMode}. */
   mode: ProfileMode;
@@ -243,6 +245,7 @@ export function normalizeProfileConfig(input: unknown): ProfileConfig {
     comments?: unknown;
     meeting?: unknown;
     larkCli?: unknown;
+    hooks?: unknown;
   };
 
   if (raw.schemaVersion !== 2) {
@@ -257,6 +260,8 @@ export function normalizeProfileConfig(input: unknown): ProfileConfig {
   }
 
   const preferences = normalizePreferences(raw.preferences);
+  const hooks = parseSessionHooks(raw.hooks);
+  validateSessionSettings(preferences.sessionAutoResetMinutes, hooks, preferences.maxConcurrentRuns ?? 10);
   const access = normalizeAccess(
     raw.access ?? raw.preferences?.access,
     raw.preferences?.requireMentionInGroup,
@@ -278,6 +283,7 @@ export function normalizeProfileConfig(input: unknown): ProfileConfig {
     accounts,
     ...(raw.secrets ? { secrets: raw.secrets } : {}),
     preferences,
+    hooks,
     access,
     workspaces,
     sandbox,
