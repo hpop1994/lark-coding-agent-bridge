@@ -1,6 +1,6 @@
 import { SessionCatalog } from '../../../src/session/catalog';
 import type { NormalizedMessage } from '@larksuite/channel';
-import { realpath } from 'node:fs/promises';
+import { realpath, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { AgentEvent } from '../../../src/agent/types.js';
@@ -83,6 +83,57 @@ afterEach(async () => {
 });
 
 describe('markdown stream startup failures', () => {
+  it.each(['text', 'markdown', 'card'] as const)('keeps a session-start checkmark without a preparation message in %s mode', async (messageReply) => {
+    const h = await createHarness({ messageReply, events: [[
+      { type: 'system', threadId: 'thread_hook_ready' },
+      { type: 'final_text', content: 'FINAL_HOOK_REPLY' }, { type: 'done', terminationReason: 'normal' },
+    ], [
+      { type: 'final_text', content: 'CONTINUED_HOOK_REPLY' }, { type: 'done', terminationReason: 'normal' },
+    ], [
+      { type: 'system', threadId: 'thread_hook_reset' },
+      { type: 'final_text', content: 'RESET_HOOK_REPLY' }, { type: 'done', terminationReason: 'normal' },
+    ]] });
+    h.profileConfig.preferences.maxConcurrentRuns = 1;
+    h.profileConfig.preferences.cotMessages = 'off';
+    const release = join(h.tmp.profile, 'release-hook');
+    h.profileConfig.hooks = { beforeSessionStart: { command: process.execPath,
+      args: ['-e', "const fs=require('node:fs');const timer=setInterval(()=>{if(fs.existsSync(process.argv[1])){clearInterval(timer)}},10)", release], timeoutMs: 3000 } };
+    const catalog = new SessionCatalog(join(h.tmp.profile, 'catalog.json')); await catalog.load();
+    await startTestBridge({ ...h, sessionCatalog: catalog });
+    await h.channel.handlers.message?.(message('om_hook_preparing', 'question'));
+    await waitFor(() => h.channel.rawClient.im.v1.messageReaction.create.mock.calls.length === 1);
+    expect(h.channel.sent).toHaveLength(0);
+    expect(h.agent.runOptions).toHaveLength(0);
+    await writeFile(release, 'ready');
+    await waitFor(() => h.channel.sent.some((entry) => JSON.stringify(entry.content).includes('FINAL_HOOK_REPLY')));
+    await waitFor(() => h.channel.rawClient.im.v1.messageReaction.delete.mock.calls.length === 1);
+    expect(h.channel.rawClient.im.v1.messageReaction.create.mock.calls.map(([input]) => input.data.reaction_type.emoji_type))
+      .toEqual(['Typing', 'DONE']);
+    expect(h.channel.rawClient.im.v1.messageReaction.delete).toHaveBeenCalledWith(expect.objectContaining({
+      path: { message_id: 'om_hook_preparing', reaction_id: 'reaction_1' },
+    }));
+    expect(h.channel.rawClient.im.v1.messageReaction.delete).not.toHaveBeenCalledWith(expect.objectContaining({
+      path: { message_id: 'om_hook_preparing', reaction_id: 'reaction_2' },
+    }));
+    expect(JSON.stringify(h.channel.sent)).not.toContain('准备脚本');
+    await h.channel.handlers.message?.(message('om_hook_continued', 'continue'));
+    await waitFor(() => h.channel.sent.some((entry) => JSON.stringify(entry.content).includes('CONTINUED_HOOK_REPLY')));
+    expect(h.agent.runOptions[1]?.threadId).toBe('thread_hook_ready');
+    expect(h.channel.rawClient.im.v1.messageReaction.create.mock.calls.filter(([input]) => input.data.reaction_type.emoji_type === 'DONE'))
+      .toHaveLength(1);
+    const resource = catalog.resources.get('oc_dm');
+    expect(resource).toBeDefined();
+    await catalog.resources.complete('oc_dm', resource!.id, Date.now() - 15 * 60000);
+    await h.channel.handlers.message?.(message('om_hook_reset', 'start after idle'));
+    await waitFor(() => h.channel.sent.some((entry) => JSON.stringify(entry.content).includes('RESET_HOOK_REPLY')));
+    expect(h.agent.runOptions[2]?.threadId).toBeUndefined();
+    expect(h.channel.rawClient.im.v1.messageReaction.create.mock.calls.filter(([input]) => input.data.reaction_type.emoji_type === 'DONE'))
+      .toHaveLength(2);
+    expect(h.channel.sent).toHaveLength(3);
+    expect(JSON.stringify(h.channel.sent)).not.toContain('已空闲');
+    await catalog.flush();
+  });
+
   it('blocks AI and sends hook failure output to the originating Feishu conversation', async () => {
     const h = await createHarness();
     h.profileConfig.preferences.maxConcurrentRuns = 1;
@@ -96,6 +147,10 @@ describe('markdown stream startup failures', () => {
     expect(JSON.stringify(h.channel.sent)).toContain('已阻断');
     const delivered = h.channel.sent.find((entry) => JSON.stringify(entry.content).includes('QA_SYNC_FAILURE'));
     expect(delivered?.options).toMatchObject({ replyTo: 'om_hook_failure' });
+    await waitFor(() => h.channel.rawClient.im.v1.messageReaction.delete.mock.calls.length === 1);
+    expect(h.channel.sent).toHaveLength(1);
+    expect(h.channel.rawClient.im.v1.messageReaction.create.mock.calls.map(([input]) => input.data.reaction_type.emoji_type))
+      .toEqual(['Typing']);
     await catalog.flush();
   });
 
@@ -550,6 +605,7 @@ function createFakeLarkChannel(harnessOptions: {
 } = {}): FakeLarkChannel {
   const handlers: MessageHandlerMap = {};
   const sent: FakeLarkChannel['sent'] = [];
+  let reactionCount = 0;
   const channel: FakeLarkChannel = {
     handlers,
     sent,
@@ -571,7 +627,7 @@ function createFakeLarkChannel(harnessOptions: {
             get: vi.fn(async () => ({ data: { items: [] } })),
           },
           messageReaction: {
-            create: vi.fn(harnessOptions.reactionCreate ?? (async () => ({ data: { reaction_id: 'reaction_1' } }))),
+            create: vi.fn(harnessOptions.reactionCreate ?? (async () => ({ data: { reaction_id: `reaction_${++reactionCount}` } }))),
             delete: vi.fn(async () => ({})),
           },
         },

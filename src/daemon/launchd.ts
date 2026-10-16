@@ -1,6 +1,6 @@
 import { spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { mkdir, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, rm, writeFile } from 'node:fs/promises';
 import { userInfo } from 'node:os';
 import { dirname } from 'node:path';
 import {
@@ -21,6 +21,8 @@ export interface PlistInputs {
    * tools (lark-cli, claude) can be resolved by name. launchd defaults
    * to a very minimal PATH otherwise. */
   envPath: string;
+  /** Explicit service environment retained when reinstalling the plist. */
+  environment?: Record<string, string>;
   /** Service id (profile name, or the reserved supervisor id) — drives the
    * label and log paths. */
   profile: string;
@@ -39,6 +41,9 @@ export function buildPlist(inputs: PlistInputs): string {
       .replace(/>/g, '&gt;')
       .replace(/"/g, '&quot;');
   const argStrings = inputs.runArgs.map((a) => `        <string>${escape(a)}</string>`).join('\n');
+  const environment = { ...inputs.environment, PATH: inputs.envPath, LARK_CHANNEL_HOME: inputs.channelHome };
+  const envStrings = Object.entries(environment).map(([name, value]) =>
+    `        <key>${escape(name)}</key>\n        <string>${escape(value)}</string>`).join('\n');
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -61,10 +66,7 @@ ${argStrings}
     <string>${escape(daemonStderrPath(inputs.profile))}</string>
     <key>EnvironmentVariables</key>
     <dict>
-        <key>PATH</key>
-        <string>${escape(inputs.envPath)}</string>
-        <key>LARK_CHANNEL_HOME</key>
-        <string>${escape(inputs.channelHome)}</string>
+${envStrings}
     </dict>
 </dict>
 </plist>
@@ -76,18 +78,40 @@ export async function writePlist(profile: string, runArgs: string[] = ['run']): 
   if (!bridgeEntryPath) {
     throw new Error('cannot determine bridge entry path (process.argv[1] is empty)');
   }
+  const plistPath = launchAgentPlistPath(profile);
+  const environment = readExistingEnvironment(plistPath);
   const content = buildPlist({
     nodePath: process.execPath,
     bridgeEntryPath,
-    envPath: process.env.PATH ?? '',
+    envPath: environment.PATH ?? process.env.PATH ?? '',
+    environment,
     profile,
     runArgs,
     channelHome: paths.rootDir,
   });
-  const plistPath = launchAgentPlistPath(profile);
   await mkdir(dirname(plistPath), { recursive: true });
   await mkdir(daemonLogDir(profile), { recursive: true });
-  await writeFile(plistPath, content, 'utf8');
+  if (existsSync(plistPath)) await chmod(plistPath, 0o600);
+  await writeFile(plistPath, content, { encoding: 'utf8', mode: 0o600 });
+}
+
+function readExistingEnvironment(plistPath: string): Record<string, string> {
+  if (!existsSync(plistPath)) return {};
+  // launchd does not source shell startup files. Preserve its explicitly
+  // provisioned environment instead of replacing it with the caller's SSH env.
+  const result = spawnSync('/usr/bin/plutil', ['-convert', 'json', '-o', '-', plistPath], { encoding: 'utf8' });
+  if (result.status !== 0) throw new Error('无法读取已有 launchd 配置，已停止更新以保留服务环境。');
+  let parsed: unknown;
+  try { parsed = JSON.parse(result.stdout); }
+  catch { throw new Error('已有 launchd 配置解析失败，已停止更新以保留服务环境。'); }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('已有 launchd 配置必须为字典。');
+  const environment = (parsed as Record<string, unknown>).EnvironmentVariables;
+  if (environment === undefined) return {};
+  if (!environment || typeof environment !== 'object' || Array.isArray(environment) ||
+      Object.values(environment).some((value) => typeof value !== 'string')) {
+    throw new Error('已有 launchd EnvironmentVariables 必须为字符串字典。');
+  }
+  return environment as Record<string, string>;
 }
 
 export function plistExists(profile: string): boolean {

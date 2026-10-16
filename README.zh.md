@@ -88,6 +88,8 @@ lark-channel-bridge unregister [--profile <name>]
 
 daemon 日志在 `~/.lark-channel/profiles/<profile>/logs/daemon/`。
 
+macOS 的 launchd 不读取 `.zprofile` 等 shell 配置。Agent 所需的 API 环境变量应显式配置在对应 plist 的 `EnvironmentVariables` 中；重新 `start` 安装服务时保留已有变量及 `PATH`，更新 CLI 路径与 channel home。plist 权限为 `0600`；已有配置无法读取时停止更新，避免静默丢失环境。
+
 ### 多 profile：分别运行 Claude 和 Codex
 
 默认情况下，bridge 使用当前激活的 profile；可以通过 `profile use <name>` 切换。每个 profile 会维护独立的应用凭据、会话、工作目录和日志。只有在需要同时连接多个 PersonalAgent 应用，或分别运行 Claude 和 Codex 时，才需要创建多个 profile：

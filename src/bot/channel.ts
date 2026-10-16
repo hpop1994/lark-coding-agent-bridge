@@ -66,7 +66,7 @@ import { PendingQueue } from './pending-queue';
 import { ProcessPool } from './process-pool';
 import { fetchQuotedContext, fetchTopicContext, type QuotedContext } from './quote';
 import { lookupMessageThreadId } from './thread-id';
-import { addWorkingReaction, removeReaction } from './reaction';
+import { addSessionPreparedReaction, addWorkingReaction, removeReaction } from './reaction';
 import { fetchKnownChats } from './lark-info';
 import type { AppPaths } from '../config/app-paths';
 import {
@@ -1002,17 +1002,17 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     controls.profileConfig.agentKind === 'codex'
       ? codexCapability(controls.profileConfig)
       : claudeCapability(controls.profileConfig);
+  let preparationReaction: Promise<string | undefined> | undefined;
+  const markSessionStart = async (): Promise<void> => {
+    preparationReaction ??= addWorkingReaction(channel, lastMsg.messageId);
+  };
   const flow = await startRunFlow({
     scopeId: scope,
     scope: scopeContext,
     prompt,
     resetPrompt: buildPrompt(batch, attachments, quotes, [], channel.botIdentity, extraInstructions),
-    onReset: async (minutes) => {
-      await channel.send(chatId, { markdown: `会话已空闲超过 ${minutes} 分钟，已开始新会话。` }, sendOpts);
-    },
-    onPreparing: async () => {
-      await channel.send(chatId, { markdown: '正在执行新会话准备脚本…' }, sendOpts);
-    },
+    onReset: markSessionStart,
+    onPreparing: markSessionStart,
     attachments: attachments.map(toPolicyAttachment),
     access: accessDecision,
     capability,
@@ -1029,8 +1029,12 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       source: 'im',
       stage: 'submit',
     },
+  }).catch((err) => {
+    scheduleWorkingReactionCleanup(channel, lastMsg.messageId, preparationReaction);
+    throw err;
   });
   if (!flow.ok) {
+    scheduleWorkingReactionCleanup(channel, lastMsg.messageId, preparationReaction);
     log.info('run-flow', 'rejected', { scope, code: flow.rejectReason.code });
     log.warn('policy', 'denied', {
       scope,
@@ -1042,6 +1046,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   }
 
   const { execution, cwdRealpath: cwd } = flow;
+  if (preparationReaction) void addSessionPreparedReaction(channel, lastMsg.messageId);
   activePolicyFingerprints.set(scope, flow.policy.policyFingerprint);
   const handle = execution.handle;
   const eventStream = execution.subscribe();
@@ -1114,7 +1119,8 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   // Add a "Typing" reaction to the triggering message as an instant ack, but
   // never let that outbound API call block agent event draining.
   const reactionPromise =
-    cotEnabled || replyMode === 'card' ? undefined : addWorkingReaction(channel, lastMsg.messageId);
+    preparationReaction ??
+    (cotEnabled || replyMode === 'card' ? undefined : addWorkingReaction(channel, lastMsg.messageId));
 
   try {
     if (cotEnabled) {

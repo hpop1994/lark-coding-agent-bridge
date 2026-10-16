@@ -16,13 +16,30 @@ export async function addWorkingReaction(
   channel: LarkChannel,
   messageId: string,
 ): Promise<string | undefined> {
+  return addStatusReaction(channel, messageId, 'Typing');
+}
+
+/** Persistent marker on the first message of a successfully prepared session. */
+export async function addSessionPreparedReaction(
+  channel: LarkChannel,
+  messageId: string,
+): Promise<string | undefined> {
+  return addStatusReaction(channel, messageId, 'DONE');
+}
+
+async function addStatusReaction(
+  channel: LarkChannel,
+  messageId: string,
+  emojiType: string,
+): Promise<string | undefined> {
   try {
-    const id = await channel.addReaction(messageId, 'Typing');
-    if (id) log.info('reaction', 'added', { messageId, reactionId: id });
+    const id = await channel.addReaction(messageId, emojiType);
+    if (id) log.info('reaction', 'added', { messageId, reactionId: id, emojiType });
     return id;
   } catch (err) {
     log.warn('reaction', 'add-failed', {
       messageId,
+      emojiType,
       err: err instanceof Error ? err.message : String(err),
     });
     return undefined;

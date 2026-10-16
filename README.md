@@ -88,6 +88,8 @@ Platform mapping:
 
 Daemon logs are under `~/.lark-channel/profiles/<profile>/logs/daemon/`.
 
+On macOS, launchd does not read shell files such as `.zprofile`. Provision required agent API environment variables in the service plist's `EnvironmentVariables`. Reinstalling through `start` preserves these variables and `PATH` while updating the CLI path and channel home. Plists use `0600` permissions; an unreadable existing configuration blocks replacement instead of silently losing the environment.
+
 ### Multiple profiles: Claude and Codex
 
 By default, the bridge starts with the currently selected profile. Use `profile use <name>` to change it. Each profile keeps its own app credentials, sessions, working directories, and logs. Create multiple profiles only when you need to connect multiple PersonalAgent apps, or run Claude and Codex as separate bots:
