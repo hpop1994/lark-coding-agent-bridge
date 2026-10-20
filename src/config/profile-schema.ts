@@ -392,7 +392,7 @@ function normalizeCodex(input: CodexConfig & { flags?: unknown }): CodexConfig {
     ...(typeof input.codexHome === 'string' ? { codexHome: input.codexHome } : {}),
     inheritCodexHome: input.inheritCodexHome !== false,
     ignoreUserConfig: input.ignoreUserConfig === true,
-    ignoreRules: input.ignoreRules !== false,
+    ignoreRules: input.ignoreRules === true,
   };
   return codex;
 }

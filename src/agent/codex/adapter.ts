@@ -1,298 +1,262 @@
-import { reapProcessGroup } from '../../platform/process-group';
-import { createInterface } from 'node:readline';
-import type { Readable, Writable } from 'node:stream';
 import { join } from 'node:path';
-import type { SandboxMode } from '../../config/profile-schema';
-import { log } from '../../core/logger';
-import { mergeProcessEnv, spawnProcess, type SpawnedProcessByStdio } from '../../platform/spawn';
-import { SpawnFailed } from '../../runtime/errors';
-import { prefixBridgeSystemPrompt } from '../bridge-system-prompt';
+import { access, realpath } from 'node:fs/promises';
+import { buildBridgeSystemPrompt } from '../bridge-system-prompt';
 import { buildLarkChannelEnv, type LarkChannelEnvContext } from '../lark-channel-env';
 import { checkAgentAvailability, type AgentAvailability } from '../preflight';
-import type {
-  AgentAdapter,
-  AgentBotIdentity,
-  AgentEvent,
-  AgentRun,
-  AgentRunOptions,
-} from '../types';
-import { buildCodexArgs } from './argv';
-import { CodexJsonlTranslator, type CodexFinishReason } from './jsonl';
+import { mergeProcessEnv } from '../../platform/spawn';
+import { log } from '../../core/logger';
+import { SpawnFailed } from '../../runtime/errors';
+import type { AgentAdapter, AgentBotIdentity, AgentRun, AgentRunOptions, AgentSteerInput } from '../types';
+import type { SandboxMode } from '../../config/profile-schema';
+import { CodexRpc, RpcError, object, string, type ObjectValue } from './rpc';
+import { EventQueue, ServerEvents } from './server-events';
 
 export interface CodexAdapterOptions {
   binary: string;
   profileStateDir: string;
   codexHome?: string;
   inheritCodexHome?: boolean;
-  ignoreUserConfig?: boolean;
-  ignoreRules?: boolean;
   sandbox?: SandboxMode;
-  stopGraceMs?: number;
   larkChannel?: LarkChannelEnvContext;
+  rpcTimeoutMs?: number;
 }
-
-type CodexChild = SpawnedProcessByStdio<Writable, Readable, Readable>;
 
 export class CodexAdapter implements AgentAdapter {
   readonly id = 'codex';
   readonly displayName = 'Codex CLI';
-
-  private readonly binary: string;
-  private readonly profileStateDir: string;
-  private readonly codexHome: string | undefined;
-  private readonly inheritCodexHome: boolean;
-  private readonly ignoreUserConfig: boolean;
-  private readonly ignoreRules: boolean;
-  private readonly sandbox: SandboxMode;
-  private readonly defaultStopGraceMs: number;
-  private readonly larkChannel: LarkChannelEnvContext | undefined;
-  private botIdentity: AgentBotIdentity | undefined;
-
-  constructor(opts: CodexAdapterOptions) {
-    this.binary = opts.binary;
-    this.profileStateDir = opts.profileStateDir;
-    this.codexHome = opts.codexHome;
-    this.inheritCodexHome = opts.inheritCodexHome !== false;
-    this.ignoreUserConfig = opts.ignoreUserConfig === true;
-    this.ignoreRules = opts.ignoreRules !== false;
-    this.sandbox = opts.sandbox ?? 'danger-full-access';
-    this.defaultStopGraceMs = opts.stopGraceMs ?? 5000;
-    this.larkChannel = opts.larkChannel;
+  private identity?: AgentBotIdentity;
+  private sessions = new Map<string, { cwd: string; server: Promise<ServerSession> }>();
+  constructor(private readonly options: CodexAdapterOptions) {}
+  setBotIdentity(identity: AgentBotIdentity): void { this.identity = identity; }
+  async isAvailable(): Promise<boolean> { return (await this.checkAvailability()).ok; }
+  checkAvailability(): Promise<AgentAvailability> {
+    return checkAgentAvailability({ agentId: 'codex', agentName: 'Codex CLI', command: this.options.binary, binaryPath: this.options.binary });
   }
-
-  setBotIdentity(identity: AgentBotIdentity): void {
-    this.botIdentity = identity;
-  }
-
-  async isAvailable(): Promise<boolean> {
-    return (await this.checkAvailability()).ok;
-  }
-
-  async checkAvailability(): Promise<AgentAvailability> {
-    return checkAgentAvailability({
-      agentId: 'codex',
-      agentName: 'Codex CLI',
-      command: this.binary,
-      binaryPath: this.binary,
-    });
-  }
-
-  async prepareRun(): Promise<void> {
+  async prepareRun(opts?: AgentRunOptions): Promise<void> {
     const availability = await this.checkAvailability();
-    if (!availability.ok) {
-      throw new SpawnFailed(
-        'codex binary check failed',
-        availability.error,
-        availability.diagnostic.code,
-        availability.diagnostic,
-      );
-    }
+    if (!availability.ok) throw new SpawnFailed('codex binary check failed', availability.error, availability.diagnostic.code, availability.diagnostic);
+    if (opts) await this.session(opts);
   }
-
   run(opts: AgentRunOptions): AgentRun {
-    if (!opts.cwd) {
-      throw new Error('cwd is required for CodexAdapter.run');
+    const run = new ServerRun(opts, async (server) => {
+      if (opts.sessionKey) return;
+      const key = opts.scopeId ?? opts.cwd!;
+      const entry = this.sessions.get(key);
+      await server.close();
+      if (this.sessions.get(key) === entry) this.sessions.delete(key);
+    });
+    run.start(this.session(opts));
+    return run;
+  }
+  async endSession(cwd: string): Promise<void> {
+    for (const [key, entry] of this.sessions) {
+      if (entry.cwd !== cwd) continue;
+      await (await entry.server).close();
+      this.sessions.delete(key);
     }
-
-    const args = buildCodexArgs({
-      cwd: opts.cwd,
-      sandbox: opts.sandbox ?? this.sandbox,
-      threadId: opts.threadId,
-      images: opts.images,
-      ignoreUserConfig: this.ignoreUserConfig,
-      ignoreRules: this.ignoreRules,
-      model: opts.model,
+  }
+  async dispose(): Promise<void> {
+    const entries = [...this.sessions.entries()];
+    const results = await Promise.allSettled(entries.map(async ([key, entry]) => {
+      await (await entry.server).close();
+      if (this.sessions.get(key) === entry) this.sessions.delete(key);
+    }));
+    const failed = results.find((r) => r.status === 'rejected');
+    if (failed?.status === 'rejected') throw failed.reason;
+  }
+  private session(opts: AgentRunOptions): Promise<ServerSession> {
+    if (!opts.cwd) return Promise.reject(new Error('cwd is required for CodexAdapter.run'));
+    const key = opts.sessionKey ?? opts.scopeId ?? opts.cwd;
+    const existing = this.sessions.get(key);
+    if (existing && existing.cwd !== opts.cwd) return Promise.reject(new Error('session cwd changed without ending the previous server'));
+    if (existing) return existing.server.then(async (server) => {
+      if (server.rpc.alive) return server;
+      await server.close();
+      if (this.sessions.get(key) === existing) this.sessions.delete(key);
+      return this.session(opts);
     });
-    const envOverrides: NodeJS.ProcessEnv = buildLarkChannelEnv(this.larkChannel);
-    if (this.codexHome) {
-      envOverrides.CODEX_HOME = this.codexHome;
-    } else if (!this.inheritCodexHome) {
-      envOverrides.CODEX_HOME = join(this.profileStateDir, 'codex-home');
-    }
-    const child = spawnProcess(this.binary, args, {
-      cwd: opts.cwd,
-      env: mergeProcessEnv(process.env, envOverrides),
-      stdio: ['pipe', 'pipe', 'pipe'],
-      detached: process.platform !== 'win32',
-    }) as CodexChild;
-
-    log.info('agent', 'spawn', {
-      pid: child.pid ?? null,
-      cwd: opts.cwd,
-      hasThread: Boolean(opts.threadId),
-      promptChars: opts.prompt.length,
-      images: opts.images?.length ?? 0,
-      model: opts.model,
-    });
-
-    const stderrChunks: Buffer[] = [];
-    let runtimeError: Error | null = null;
-    let stderrBuffer = '';
-    child.stderr.on('data', (chunk: Buffer) => {
-      stderrChunks.push(chunk);
-      stderrBuffer += chunk.toString('utf8');
-      let nl = stderrBuffer.indexOf('\n');
-      while (nl !== -1) {
-        const line = stderrBuffer.slice(0, nl);
-        stderrBuffer = stderrBuffer.slice(nl + 1);
-        if (line.trim()) log.warn('agent', 'stderr', { line });
-        if (isWindowsCommandNotFoundLine(line)) {
-          runtimeError = new Error(`failed to spawn codex: ${line.trim()}`);
-          child.stdout.destroy();
-          child.kill();
-        }
-        nl = stderrBuffer.indexOf('\n');
-      }
-    });
-
-    let stopReason: CodexFinishReason | undefined;
-    child.on('error', (err) => {
-      runtimeError = err;
-    });
-    child.on('exit', (code, signal) => {
-      log.info('agent', 'exit', { pid: child.pid ?? null, code, signal });
-    });
-    child.stdin.on('error', (err) => {
-      log.warn('agent', 'stdin-error', { message: err.message });
-    });
-    child.stdin.end(prefixBridgeSystemPrompt(opts.prompt, this.botIdentity), 'utf8');
-
-    const stopGraceMs = opts.stopGraceMs ?? this.defaultStopGraceMs;
-
-    return {
-      runId: opts.runId,
-      events: createEventStream(child, stderrChunks, () => runtimeError, () => stopReason),
-      reap: () => reapProcessGroup(child),
-      async stop() {
-        if (child.exitCode !== null || child.signalCode !== null) return;
-        stopReason = 'interrupted';
-        log.info('agent', 'stop-sigterm', { pid: child.pid ?? null, graceMs: stopGraceMs });
-        child.kill('SIGTERM');
-        await new Promise<void>((resolve) => {
-          const timer = setTimeout(() => {
-            if (child.exitCode === null && child.signalCode === null) {
-              log.warn('agent', 'stop-sigkill', {
-                pid: child.pid ?? null,
-                graceMs: stopGraceMs,
-                reason: 'grace-period-expired',
-              });
-              child.kill('SIGKILL');
-            }
-            resolve();
-          }, stopGraceMs);
-          child.once('exit', () => {
-            clearTimeout(timer);
-            resolve();
-          });
-        });
-      },
-      waitForExit(timeoutMs: number): Promise<boolean> {
-        if (child.exitCode !== null || child.signalCode !== null) {
-          return Promise.resolve(true);
-        }
-        return new Promise<boolean>((resolve) => {
-          const onExit = (): void => {
-            clearTimeout(timer);
-            resolve(true);
-          };
-          const timer = setTimeout(() => {
-            child.removeListener('exit', onExit);
-            resolve(false);
-          }, timeoutMs);
-          child.once('exit', onExit);
-        });
-      },
-    };
+    const env = buildLarkChannelEnv(this.options.larkChannel);
+    if (this.options.codexHome) env.CODEX_HOME = this.options.codexHome;
+    else if (this.options.inheritCodexHome === false) env.CODEX_HOME = join(this.options.profileStateDir, 'codex-home');
+    const rpc = new CodexRpc(this.options.binary, opts.cwd, mergeProcessEnv(process.env, env), this.options.rpcTimeoutMs);
+    const server = new ServerSession(rpc, opts.cwd);
+    const abort = (): void => { void server.close().catch((error) => log.fail('agent', error, { step: 'abort-server-preparation' })); };
+    opts.signal?.addEventListener('abort', abort, { once: true });
+    const ready = server.initialize(opts, this.options.sandbox ?? 'danger-full-access', buildBridgeSystemPrompt(this.identity))
+      .then(() => server)
+      .catch(async (error: unknown) => {
+        this.sessions.delete(key);
+        await server.close();
+        throw error;
+      }).finally(() => opts.signal?.removeEventListener('abort', abort));
+    this.sessions.set(key, { cwd: opts.cwd, server: ready });
+    return ready;
   }
 }
 
-async function* createEventStream(
-  child: CodexChild,
-  stderrChunks: Buffer[],
-  getError: () => Error | null,
-  getStopReason: () => CodexFinishReason | undefined,
-): AsyncGenerator<AgentEvent> {
-  const translator = new CodexJsonlTranslator();
-  if (!child.pid) {
-    const err = getError();
-    yield {
-      type: 'error',
-      message: err ? `failed to spawn codex: ${err.message}` : 'spawn returned no pid',
-      terminationReason: 'failed',
-    };
-    return;
-  }
+function inputItems(prompt: string, images?: readonly string[]): ObjectValue[] {
+  return [{ type: 'text', text: prompt }, ...(images ?? []).map((path) => ({ type: 'localImage', path }))];
+}
 
-  const rl = createInterface({ input: child.stdout, crlfDelay: Infinity });
-  let sawStdout = false;
-  let silentExitTimer: ReturnType<typeof setTimeout> | undefined;
-  const closeSilentStdout = (): void => {
-    silentExitTimer = setTimeout(() => {
-      if (!sawStdout && !child.stdout.readableEnded) child.stdout.destroy();
-    }, 50);
-  };
-  child.once('exit', closeSilentStdout);
-  try {
-    for await (const line of rl) {
-      sawStdout = true;
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      let parsed: unknown;
+class ServerSession {
+  threadId!: string;
+  model!: string;
+  private active?: ServerRun;
+  constructor(readonly rpc: CodexRpc, readonly cwd: string) {
+    rpc.onNotification = (method, params) => {
+      if (params.threadId !== this.threadId) return;
+      if (method === 'error') log.warn('agent', 'server-error', { threadId: this.threadId, turnId: params.turnId, error: params.error, willRetry: params.willRetry });
+      if (method === 'turn/completed') log.info('agent', 'server-turn-ended', { threadId: this.threadId, turnId: object(params.turn).id, status: object(params.turn).status });
+      this.active?.notification(method, params);
+    };
+    rpc.onFailure = (error) => this.active?.fail(error);
+    rpc.onRequest = (method) => {
+      const active = this.active;
+      if (!active) return;
+      active.queue.push({ type: 'error', message: `Codex requested interactive input (${method}); this Bridge supports text follow-ups via steer. The turn was stopped.`, terminationReason: 'failed' });
+      void active.stop().catch(async (error) => {
+        log.fail('agent', error, { step: 'unsupported-server-request' });
+        await this.close();
+      });
+    };
+  }
+  async initialize(opts: AgentRunOptions, sandbox: SandboxMode, instructions: string): Promise<void> {
+    await this.rpc.request('initialize', { clientInfo: { name: 'lark_channel_bridge', title: 'Lark Channel Bridge', version: '0.7.1-qa.3' }, capabilities: { experimentalApi: true } });
+    this.rpc.notify('initialized');
+    const response = await this.rpc.request(opts.threadId ? 'thread/resume' : 'thread/start', {
+      ...(opts.threadId ? { threadId: opts.threadId } : {}), cwd: this.cwd,
+      ...(opts.model ? { model: opts.model } : {}), approvalPolicy: 'never', sandbox: opts.sandbox ?? sandbox,
+      developerInstructions: instructions,
+    });
+    this.threadId = string(object(response.thread).id);
+    this.model = string(response.model);
+    try {
+      await access(join(this.cwd, 'AGENTS.md'));
+      const expected = await realpath(join(this.cwd, 'AGENTS.md'));
+      const sources = response.instructionSources;
+      if (!Array.isArray(sources) || !sources.includes(expected)) throw new Error('app-server did not load the session AGENTS.md');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+    log.info('agent', 'server-ready', { pid: this.rpc.child.pid, threadId: this.threadId, cwd: this.cwd, model: this.model });
+  }
+  async begin(run: ServerRun): Promise<void> {
+    if (!this.rpc.alive) throw new Error('session app-server is unavailable; begin a new session');
+    if (this.active) throw new Error('previous turn has not completed cleanup');
+    this.active = run;
+    run.session = this;
+    run.queue.push({ type: 'system', threadId: this.threadId, cwd: this.cwd, model: run.options.model ?? this.model });
+    const response = await this.rpc.request('turn/start', {
+      threadId: this.threadId, input: inputItems(run.options.prompt, run.options.images),
+      ...(run.options.model ? { model: run.options.model } : {}),
+      approvalPolicy: 'never',
+    });
+    run.setTurnId(string(object(response.turn).id));
+  }
+  async finish(run: ServerRun): Promise<void> {
+    await run.steers;
+    if (this.active !== run) return;
+    try {
+      if (!this.rpc.alive) await this.close();
+      else await this.rpc.request('thread/backgroundTerminals/clean', { threadId: this.threadId });
+    } catch (error) {
+      await this.close();
+      throw error;
+    } finally { this.active = undefined; }
+  }
+  close(): Promise<void> { return this.rpc.close(); }
+}
+
+class ServerRun implements AgentRun {
+  readonly runId: string;
+  readonly queue = new EventQueue();
+  readonly events = this.queue;
+  readonly translator = new ServerEvents(this.queue);
+  session?: ServerSession;
+  private turnId?: string;
+  private terminal = false;
+  private stopping?: Promise<void>;
+  private finish?: Promise<void>;
+  private resolveDone!: () => void;
+  private done = new Promise<void>((resolve) => { this.resolveDone = resolve; });
+  private started!: Promise<void>;
+  steers: Promise<unknown> = Promise.resolve();
+  constructor(readonly options: AgentRunOptions, private readonly releaseSession: (server: ServerSession) => Promise<void>) { this.runId = options.runId; }
+  start(server: Promise<ServerSession>): void {
+    this.started = server.then((session) => session.begin(this)).catch(async (error: unknown) => {
+      if (this.session) await this.session.close();
+      this.fail(error);
+    });
+  }
+  setTurnId(id: string): void {
+    if (this.turnId && this.turnId !== id) throw new Error('app-server turn identity changed');
+    this.turnId = id;
+  }
+  notification(method: string, params: ObjectValue): void {
+    if (this.terminal) return;
+    if (method === 'turn/started') this.setTurnId(string(object(params.turn).id));
+    if (params.turnId && this.turnId && params.turnId !== this.turnId) return;
+    if (method === 'turn/completed') {
+      const turn = object(params.turn);
+      if (this.turnId && turn.id !== this.turnId) return;
+      this.translator.finish(this.session!.threadId, turn);
+      this.terminal = true;
+      this.resolveDone();
+    } else this.translator.notification(method, params);
+  }
+  fail(error: unknown): void {
+    if (this.terminal) return;
+    this.terminal = true;
+    this.queue.push({ type: 'error', message: error instanceof Error ? error.message : String(error), terminationReason: 'failed' });
+    this.queue.end(); this.resolveDone();
+  }
+  async steer(input: AgentSteerInput): Promise<boolean> {
+    const delivery = this.steers.then(async () => {
+      await this.started;
+      if (this.terminal || !this.session || !this.turnId) return false;
       try {
-        parsed = JSON.parse(trimmed);
-      } catch {
-        continue;
+        const response = await this.session.rpc.request('turn/steer', {
+          threadId: this.session.threadId, expectedTurnId: this.turnId,
+          input: inputItems(input.prompt, input.images), clientUserMessageId: input.messageId,
+        });
+        if (response.turnId !== this.turnId) throw new Error('steer acknowledged a different turn');
+        log.info('agent', 'steer-accepted', { runId: this.runId, turnId: this.turnId, messageId: input.messageId });
+        return true;
+      } catch (error) {
+        if (error instanceof RpcError && /no active turn|expected.*turn|turn.*mismatch/i.test(error.message)) return false;
+        throw error;
       }
-      yield* translator.translate(parsed);
-    }
-  } finally {
-    if (silentExitTimer) clearTimeout(silentExitTimer);
-    child.removeListener('exit', closeSilentStdout);
-    rl.close();
+    });
+    this.steers = delivery.catch(() => {});
+    return delivery;
   }
-
-  const earlyRuntimeError = getError();
-  if (earlyRuntimeError && child.exitCode === null && child.signalCode === null) {
-    yield* translator.fail(`codex runtime error: ${earlyRuntimeError.message}`);
-    return;
+  stop(): Promise<void> {
+    return this.stopping ??= (async () => {
+      await this.started;
+      const session = this.session;
+      if (!session) return;
+      if (!this.terminal && this.turnId) {
+        try { await session.rpc.request('turn/interrupt', { threadId: session.threadId, turnId: this.turnId }); }
+        catch (error) { await session.close(); this.fail(error); throw error; }
+        if (!(await this.waitForExit(this.options.stopGraceMs ?? 5000))) {
+          await session.close();
+          this.fail(new Error('Codex did not complete interruption; session server was closed'));
+        }
+      }
+    })();
   }
-
-  const exitCode = await waitForExitCode(child);
-  const stopReason = getStopReason();
-  if (stopReason) {
-    yield* translator.finish(stopReason);
-    return;
+  async waitForExit(timeoutMs: number): Promise<boolean> {
+    let timer: NodeJS.Timeout | undefined;
+    try { return await Promise.race([this.done.then(() => true), new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), timeoutMs); })]); }
+    finally { if (timer) clearTimeout(timer); }
   }
-
-  const runtimeError = getError();
-  if (exitCode !== 0 && exitCode !== null) {
-    if (!translator.terminalEmitted()) {
-      const stderr = Buffer.concat(stderrChunks).toString('utf8').trim();
-      const detail = stderr ? `: ${stderr.slice(0, 500)}` : '';
-      yield* translator.fail(`codex exited with code ${exitCode}${detail}`);
-    }
-    return;
+  reap(): Promise<void> {
+    return this.finish ??= (async () => {
+      await this.started; await this.done;
+      if (this.session) {
+        try { await this.session.finish(this); }
+        finally { await this.releaseSession(this.session); }
+      }
+    })();
   }
-  if (runtimeError && !translator.terminalEmitted()) {
-    yield* translator.fail(`codex runtime error: ${runtimeError.message}`);
-    return;
-  }
-
-  yield* translator.finish();
-}
-
-async function waitForExitCode(child: CodexChild): Promise<number | null> {
-  if (child.exitCode !== null || child.signalCode !== null) {
-    return child.exitCode;
-  }
-  return new Promise<number | null>((resolve) => {
-    child.once('exit', (code) => resolve(code));
-  });
-}
-
-function isWindowsCommandNotFoundLine(line: string): boolean {
-  return (
-    process.platform === 'win32' &&
-    /is not recognized as an internal or external command|operable program or batch file/i.test(line)
-  );
 }

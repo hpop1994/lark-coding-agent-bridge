@@ -8,7 +8,7 @@ import { RunRejected } from '../runtime/errors';
 import { log } from '../core/logger';
 
 export interface RunPreparation {
-  prepare(signal: AbortSignal): Promise<{ sessionId?: string; threadId?: string; prompt?: string; cwd?: string }>;
+  prepare(signal: AbortSignal): Promise<{ sessionId?: string; threadId?: string; prompt?: string; cwd?: string; sessionKey?: string }>;
   cancel?(): Promise<void>;
   onEvent(event: AgentEvent): void;
   finish(): Promise<void>;
@@ -100,6 +100,7 @@ export function sessionLifecycle(input: {
       }
       signal.throwIfAborted();
       return {
+        sessionKey: resource?.id ?? identity.scopeId,
         cwd: resource?.cwd ?? identity.cwdRealpath,
         ...(identity.agentId === 'claude' ? { sessionId: result.resumeFrom } : { threadId: result.resumeFrom }),
         ...(replacing && input.resetPrompt !== undefined ? { prompt: input.resetPrompt } : {}),

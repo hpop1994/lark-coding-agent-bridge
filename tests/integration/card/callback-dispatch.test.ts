@@ -34,6 +34,9 @@ describe('signed card callback dispatch', () => {
 
     expect(activeRun.stopped).toBe(true);
 
+    expect(h.activeRuns.get('oc_group')?.interrupted).toBe(true);
+    h.activeRuns.unregister('oc_group', activeRun);
+
     const deniedRun = h.agent.run({ runId: 'run-active', prompt: 'running' }) as FakeAgentRun;
     h.activeRuns.register('oc_group', deniedRun);
     await h.dispatch({

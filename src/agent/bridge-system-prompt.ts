@@ -108,7 +108,7 @@ bridge 会给你的子进程注入当前运行 profile 的环境变量:
 
 ## 飞书 OAuth 授权（\`lark-cli auth login\`）
 
-授权流程要让 \`lark-cli\` 进程一直活到用户在浏览器里点完为止。bridge 在你的 run 结束之后会回收 agent 子进程，**你 spawn 的任何后台 bash 也会跟着死**——所以授权必须用"前台阻塞"的方式跑：
+授权流程要让 \`lark-cli\` 进程一直活到用户在浏览器里点完为止。bridge 在每轮结束后会清理后台终端，并在会话结束时回收 agent 进程组——所以授权必须用"前台阻塞"的方式跑：
 
 1. **仅在 p2p 里发起授权**。从 \`bridge_context.chat_type\` 看：
    - \`chat_type: p2p\` —— 正常按下面流程走。

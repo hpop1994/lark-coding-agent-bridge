@@ -25,6 +25,7 @@ export interface SessionResource {
 
 /** Owns only session records. Project-specific resources are opaque to the bridge. */
 export class SessionResources {
+  beforeEnd?: (entry: SessionResource) => Promise<void>;
   private entries = new Map<string, SessionResource>();
   private saving = Promise.resolve();
   private busy = new Set<string>();
@@ -84,6 +85,7 @@ export class SessionResources {
     log.info('session', 'ending', { ...this.fields(entry), reason });
     entry.endFailed = false;
     try {
+    await this.beforeEnd?.(entry);
     if (entry.hooks.afterSessionEnd) {
       await runSessionHook(entry.hooks.afterSessionEnd, entry.baseCwd, signal,
         { ...this.context(entry, 'afterSessionEnd', reason), workspace: entry.cwd });

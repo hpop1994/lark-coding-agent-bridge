@@ -305,7 +305,7 @@ describe('profile schema', () => {
       mode: 0o755,
       inheritCodexHome: true,
       ignoreUserConfig: false,
-      ignoreRules: true,
+      ignoreRules: false,
     });
     expect(cfg.codex).not.toHaveProperty('flags');
   });

@@ -3,6 +3,7 @@ import type { AgentRun } from '../agent/types';
 export interface RunHandle {
   run: AgentRun;
   interrupted: boolean;
+  waitForCompletion?(): Promise<void>;
 }
 
 export class ActiveRuns {
@@ -95,9 +96,7 @@ export class ActiveRuns {
       preparing.abort();
       return true;
     }
-    this.reservations.delete(chatId);
     h.interrupted = true;
-    this.handles.delete(chatId);
     void h.run.stop().catch(() => {
       /* stop errors are non-fatal */
     });
@@ -111,7 +110,10 @@ export class ActiveRuns {
     this.handles.clear();
     this.reservations.clear();
     for (const h of all) h.interrupted = true;
-    await Promise.allSettled(all.map((h) => h.run.stop()));
+    await Promise.allSettled(all.map(async (h) => {
+      try { await h.run.stop(); }
+      finally { await h.waitForCompletion?.(); }
+    }));
     await Promise.all(pending);
   }
 

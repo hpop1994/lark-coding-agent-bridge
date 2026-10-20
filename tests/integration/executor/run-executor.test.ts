@@ -19,6 +19,23 @@ afterEach(async () => {
 });
 
 describe('RunExecutor', () => {
+  it('waits for terminal cleanup before allowing the next run in the same scope', async () => {
+    const h = await createHarness({ events: [{ type: 'done', terminationReason: 'normal' }] });
+    let release!: () => void;
+    const cleaning = new Promise<void>((resolve) => { release = resolve; });
+    const first = await h.executor.submit({ scopeId: 'scope-1', policy: policy(h.tmp.workspace) });
+    first.run.reap = () => cleaning;
+    const iterator = first.subscribe()[Symbol.asyncIterator]();
+    expect((await iterator.next()).value?.type).toBe('done');
+    let completed = false;
+    const completion = first.waitForCompletion().then(() => { completed = true; });
+    await Promise.resolve(); expect(completed).toBe(false);
+    await expect(h.executor.submit({ scopeId: 'scope-1', policy: policy(h.tmp.workspace) })).rejects.toMatchObject({ code: 'run-already-active' });
+    release(); await completion;
+    const second = await h.executor.submit({ scopeId: 'scope-1', policy: policy(h.tmp.workspace) });
+    await collect(second.subscribe());
+  });
+
   it('generates one runId and wires it through adapter, record, and active runs', async () => {
     const h = await createHarness({
       events: [{ type: 'done', terminationReason: 'normal' }],

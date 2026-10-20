@@ -38,13 +38,14 @@ export function createRuntimeAgent(
     if (!codex?.binaryPath) {
       throw new Error('codex profile requires codex.binaryPath');
     }
+    if (codex.ignoreRules || codex.ignoreUserConfig) {
+      throw new Error('Codex app-server does not support ignoreRules/ignoreUserConfig; use an explicit codexHome for configuration isolation');
+    }
     return new CodexAdapter({
       binary: codex.binaryPath,
       profileStateDir: appPaths.profileDir,
       ...(codex.codexHome ? { codexHome: codex.codexHome } : {}),
       inheritCodexHome: codex.inheritCodexHome === true,
-      ignoreUserConfig: codex.ignoreUserConfig === true,
-      ignoreRules: codex.ignoreRules !== false,
       sandbox: profileConfig.sandbox.defaultMode,
       larkChannel,
     });

@@ -41,6 +41,7 @@ export interface RunExecution {
   run: AgentRun;
   handle: RunHandle;
   subscribe(): AsyncIterable<AgentEvent>;
+  waitForCompletion(): Promise<void>;
   stop(): Promise<void>;
 }
 
@@ -99,6 +100,8 @@ export class RunExecutor {
     const queueWaitMs = startedAt - submittedAt;
     const runOptions = {
       runId,
+      scopeId: input.scopeId,
+      signal: controller.signal,
       prompt: input.policy.prompt,
       cwd: input.policy.cwdRealpath,
       sessionId: input.sessionId,
@@ -173,34 +176,35 @@ export class RunExecutor {
         err instanceof Error ? err.message : 'another run is already active for this scope',
       );
     }
-    let cleaned = false;
-    const cleanup = async (waitForExit: boolean): Promise<void> => {
-      if (cleaned) return;
-      cleaned = true;
-      if (waitForExit) {
-        const exited = await run.waitForExit(this.postDoneExitGraceMs);
-        if (!exited) {
-          log.warn('run', 'post-done-exit-timeout', {
-            ...dimensions,
-            graceMs: this.postDoneExitGraceMs,
-          });
-          await run.stop().catch((err) => {
-            log.warn('run', 'post-done-stop-failed', {
-              ...dimensions,
-              err: err instanceof Error ? err.message : String(err),
-            });
-          });
-        }
-      }
+    let cleaning: Promise<void> | undefined;
+    const cleanup = (waitForExit: boolean): Promise<void> => cleaning ??= (async () => {
       try {
-        await run.reap?.();
-        await input.preparation?.finish();
+        if (waitForExit) {
+          const exited = await run.waitForExit(this.postDoneExitGraceMs);
+          if (!exited) {
+            log.warn('run', 'post-done-exit-timeout', {
+              ...dimensions,
+              graceMs: this.postDoneExitGraceMs,
+            });
+            await run.stop().catch((err) => {
+              log.warn('run', 'post-done-stop-failed', {
+                ...dimensions,
+                err: err instanceof Error ? err.message : String(err),
+              });
+            });
+          }
+        }
+        const failures: unknown[] = [];
+        try { await run.reap?.(); } catch (error) { failures.push(error); }
+        try { await input.preparation?.finish(); } catch (error) { failures.push(error); }
+        if (failures.length === 1) throw failures[0];
+        if (failures.length > 1) throw new AggregateError(failures, 'run cleanup and session persistence failed');
       } finally {
         this.activeRuns.unregister(input.scopeId, run);
         releaseScope();
         release();
       }
-    };
+    })();
     const events: AsyncIterable<AgentEvent> = {
       async *[Symbol.asyncIterator]() {
         for await (const event of run.events) {
@@ -216,6 +220,7 @@ export class RunExecutor {
     }), async () => {
       await cleanup(!handle.interrupted);
     });
+    handle.waitForCompletion = () => fanout.waitForCompletion();
 
     return {
       runId,
@@ -223,11 +228,13 @@ export class RunExecutor {
       run,
       handle,
       subscribe: () => fanout.subscribe(),
+      waitForCompletion: () => fanout.waitForCompletion(),
       stop: async () => {
         handle.interrupted = true;
-        await run.stop();
-        await run.waitForExit(this.postDoneExitGraceMs);
-        await cleanup(false);
+        try {
+          await run.stop();
+          await run.waitForExit(this.postDoneExitGraceMs);
+        } finally { await cleanup(false); }
       },
     };
   }
@@ -274,7 +281,7 @@ class EventFanout {
   private readonly onDone: () => Promise<void>;
   private readonly buffer: AgentEvent[] = [];
   private readonly waiters = new Set<() => void>();
-  private started = false;
+  private pumping?: Promise<void>;
   private done = false;
   private error: unknown;
 
@@ -314,9 +321,13 @@ class EventFanout {
   }
 
   private start(): void {
-    if (this.started) return;
-    this.started = true;
-    void this.pump();
+    this.pumping ??= this.pump();
+  }
+
+  async waitForCompletion(): Promise<void> {
+    this.start();
+    await this.pumping;
+    if (this.error) throw this.error;
   }
 
   private async pump(): Promise<void> {

@@ -79,6 +79,16 @@ Bridge 在准备前持久化会话记录。记录与状态位于 profile 的 `se
 
 结束 Hook 失败保留 `ending` 记录并输出错误，不静默恢复旧 thread；定时扫描不无限重试或反复发通知。该会话下次请求先重试结束，仍失败则继续阻断。已经结束的记录保留结束原因，以便下次新请求标记自动重置。配置结束 Hook 的 profile 不允许通过 `/resume` 把历史 thread 绑定到新的项目资源。
 
+## Codex app-server 与连续消息
+
+Codex 每个逻辑会话拥有独立的 stdio app-server 和 thread，多轮 turn 复用同一进程。首次启动和恢复均显式指定 hook 返回的 cwd、权限和 Bridge 运行指令；cwd 存在 AGENTS.md 时，必须在 instructionSources 中确认已经加载。
+
+同一聊天/话题中，同一发起人在运行中追加的普通消息经过附件、访问和策略校验后走 turn/steer，携带真实发送者上下文、图片及消息 ID。不同发起人、模型或权限策略变化，以及尚在准备或结束的会话保留排队。追加成功的消息获得 DONE 标记，最终答案回复最新参与消息。服务端明确返回当前 turn 已结束时，按原顺序转入下一轮；投递超时或结果不确定时可见报错，不自动重发。
+
+turn/completed 后先清理该 thread 的后台终端并持久化本轮，再释放运行名额与消息队列；不等待常驻 server 自行退出。/stop 中断当前 turn，保留 thread；/new、空闲回收与资源替换先终止 server 进程组，再执行 afterSessionEnd。Bridge 停止时回收所有 server，重启后从持久化 thread 恢复；旧执行中的请求不自动重放。
+
+Codex app-server 继承当前 CODEX_HOME 中的 provider、模型和 execpolicy，以显式 approvalPolicy=never 与本轮 sandbox 控制执行权限。exec 专用 ignoreRules/ignoreUserConfig 不受支持，开启会阻断启动；需要配置隔离时使用独立 codexHome。请求审批或交互表单时明确失败并中断本轮，当前消息入口只支持文本/图片追加。
+
 ## 日志
 
 Hook 日志汇入 profile 的 `logs/bridge-YYYYMMDD.jsonl`，沿用默认 30 天保留策略。记录事件、profile、scope、稳定 session ID、执行目录、触发原因、耗时、退出码与分流的 stdout/stderr，以及会话准备、结束和扫描器启动事件。消息触发时同时带上现有 trace/message 上下文。

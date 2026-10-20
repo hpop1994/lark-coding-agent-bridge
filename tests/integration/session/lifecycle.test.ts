@@ -25,6 +25,19 @@ const signal = () => new AbortController().signal;
 const hook = (code: string, cwd?: string, timeoutMs = 3000) => ({ command: process.execPath, args: ['-e', code], cwd, timeoutMs });
 
 describe('session lifecycle contract', () => {
+  it('reaps the session server before invoking the destructive end hook', async () => {
+    const path = await root(); const resources = new SessionResources(join(path, 'resources.json'));
+    const marker = join(path, 'released');
+    await resources.create({ scopeId: 'a', agentId: 'codex', profile: 'qa', baseCwd: path, fingerprint: 'p',
+      hooks: { afterSessionEnd: hook(`require('fs').writeFileSync(${JSON.stringify(marker)}, 'released')`, path) } }, signal());
+    let release!: () => void; const reaping = new Promise<void>((resolve) => { release = resolve; });
+    resources.beforeEnd = async () => { await reaping; };
+    const ending = resources.end('a', 'manual_reset');
+    await new Promise(resolve => setTimeout(resolve, 30));
+    await expect(readFile(marker, 'utf8')).rejects.toThrow();
+    release(); await ending; expect(await readFile(marker, 'utf8')).toBe('released');
+  });
+
   it('defaults to 15 minutes and rejects invalid configuration', () => {
     expect(sessionAutoResetMinutes()).toBe(15);
     expect(sessionAutoResetMinutes(0)).toBe(0);

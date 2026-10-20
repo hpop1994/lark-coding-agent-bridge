@@ -30,6 +30,9 @@ export const CLAUDE_DEFAULT_PERMISSION_MODE: ClaudePermissionMode = 'bypassPermi
 
 export interface AgentRunOptions {
   runId: string;
+  scopeId?: string;
+  sessionKey?: string;
+  signal?: AbortSignal;
   prompt: string;
   cwd?: string;
   sessionId?: string;
@@ -48,14 +51,22 @@ export interface AgentRunOptions {
   stopGraceMs?: number;
 }
 
+export interface AgentSteerInput {
+  prompt: string;
+  images?: readonly string[];
+  messageId: string;
+}
+
 export interface AgentRun {
   readonly runId: string;
   readonly events: AsyncIterable<AgentEvent>;
   stop(): Promise<void>;
+  /** False means the turn explicitly declined delivery because it already ended. */
+  steer?(input: AgentSteerInput): Promise<boolean>;
   /** Release adapter-owned descendants before a session resource can be disposed. */
   reap?(): Promise<void>;
   /**
-   * Wait up to `timeoutMs` for the agent process to exit on its own.
+   * Wait up to `timeoutMs` for execution to finish (a turn for persistent servers).
    * Resolves true if it exited within the window, false if the timer
    * fired first (caller usually wants to fall back to stop()).
    *
@@ -85,6 +96,8 @@ export interface AgentAdapter {
   checkAvailability?(): Promise<AgentAvailability>;
   prepareRun?(opts: AgentRunOptions): Promise<void>;
   run(opts: AgentRunOptions): AgentRun;
+  endSession?(cwd: string): Promise<void>;
+  dispose?(): Promise<void>;
   /**
    * Late-bound identity injection: the adapter is constructed before the
    * channel connects, so the channel calls this once botIdentity is known.

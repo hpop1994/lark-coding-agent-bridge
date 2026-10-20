@@ -24,7 +24,7 @@ Fork: https://github.com/hpop1994/lark-coding-agent-bridge 。
 - `/Volumes/ZHITAI/project/lib_proj/libtv-qa/hooks/session.py`
 - `/Volumes/ZHITAI/project/lib_proj/libtv-mobile-qa/hooks/session.py`
 
-各自在 QA 根目录的 workspaces/<session-id> 下创建会话目录，包含本项目源码仓库。父目录 AGENTS.md 为所有会话提供一致的答疑边界。所有部署前规则和配置均保留备份。
+各自在 QA 根目录的 workspaces/<session-id> 下创建会话目录，包含本项目源码仓库。准备脚本将 QA 根目录的 AGENTS.md 复制到会话 cwd，作为本会话固定的规则快照；缺失或空文件阻断准备。Codex 在没有项目根目录时只发现 cwd 的指令文件，不能依赖祖先 QA 目录中的 AGENTS.md 自动加载。所有部署前规则和配置均保留备份。
 
 ## mbp14 验证记录
 

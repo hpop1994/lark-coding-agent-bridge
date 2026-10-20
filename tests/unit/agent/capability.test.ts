@@ -42,7 +42,7 @@ describe('agent capability contract', () => {
     expect(codexCapability(profile)).toMatchObject({
       agentId: 'codex',
       sessionKind: 'codex-thread',
-      promptInjection: 'stdin-prefix',
+      promptInjection: 'developer-instructions',
       supportsNativeHistory: false,
       systemPrompt: BRIDGE_SYSTEM_PROMPT,
       permissions: {

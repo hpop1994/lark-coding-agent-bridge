@@ -83,6 +83,82 @@ afterEach(async () => {
 });
 
 describe('markdown stream startup failures', () => {
+  it('steers a same-sender follow-up into the active run and replies to that message', async () => {
+    const h = await createHarness({ events: [] });
+    const completed = deferred<void>();
+    const steered: Array<unknown> = [];
+    const original = h.agent.run.bind(h.agent);
+    vi.spyOn(h.agent, 'run').mockImplementation((opts) => {
+      const fake = original(opts);
+      return { ...fake, runId: opts.runId,
+        events: { async *[Symbol.asyncIterator]() {
+          yield { type: 'system' as const, threadId: 'thread-steer' };
+          await completed.promise;
+          yield { type: 'final_text' as const, content: 'STEERED_ANSWER' };
+          yield { type: 'done' as const, terminationReason: 'normal' as const };
+        } },
+        stop: async () => { completed.resolve(); }, waitForExit: async () => true,
+        steer: async (input) => { steered.push(input); completed.resolve(); return true; },
+      };
+    });
+    await startTestBridge(h);
+    await h.channel.handlers.message?.(message('om_first', 'original question'));
+    await waitFor(() => h.agent.runOptions.length === 1);
+    await h.channel.handlers.message?.(message('om_second', 'follow-up requirement'));
+    await waitFor(() => h.channel.sent.some(e => JSON.stringify(e.content).includes('STEERED_ANSWER')));
+    expect(h.agent.runOptions).toHaveLength(1);
+    expect(steered).toHaveLength(1);
+    expect(JSON.stringify(steered)).toContain('follow-up requirement');
+    expect(JSON.stringify(steered)).toContain('ou_user');
+    expect(h.channel.sent.find(e => JSON.stringify(e.content).includes('STEERED_ANSWER'))?.options).toMatchObject({ replyTo: 'om_second' });
+  });
+
+  it('queues a different sender without steering or inheriting the first sender context', async () => {
+    const h = await createHarness({ events: [[], [{ type: 'final_text', content: 'OTHER_SENDER_ANSWER' }, { type: 'done', terminationReason: 'normal' }]] });
+    h.profileConfig.access.allowedUsers.push('ou_other');
+    const completed = deferred<void>(); const steer = vi.fn();
+    const original = h.agent.run.bind(h.agent);
+    vi.spyOn(h.agent, 'run').mockImplementation((opts) => {
+      const fake = original(opts);
+      if (h.agent.runOptions.length > 1) return fake;
+      return { ...fake, runId: opts.runId, events: { async *[Symbol.asyncIterator]() {
+        await completed.promise; yield { type: 'final_text' as const, content: 'FIRST_ANSWER' };
+        yield { type: 'done' as const, terminationReason: 'normal' as const };
+      } }, stop: async () => { completed.resolve(); }, waitForExit: async () => true, steer };
+    });
+    await startTestBridge(h);
+    await h.channel.handlers.message?.(message('om_first', 'first'));
+    await waitFor(() => h.agent.runOptions.length === 1);
+    await h.channel.handlers.message?.({ ...message('om_other', 'other question'), senderId: 'ou_other' });
+    await new Promise(resolve => setTimeout(resolve, 800));
+    expect(steer).not.toHaveBeenCalled(); expect(h.agent.runOptions).toHaveLength(1);
+    completed.resolve();
+    await waitFor(() => h.channel.sent.some(e => JSON.stringify(e.content).includes('OTHER_SENDER_ANSWER')));
+    expect(h.agent.runOptions).toHaveLength(2); expect(h.agent.runOptions[1]?.prompt).toContain('ou_other');
+  });
+
+  it('keeps follow-up messages queued until delayed cleanup finishes', async () => {
+    const h = await createHarness({ events: [[{ type: 'final_text', content: 'FIRST' }, { type: 'done', terminationReason: 'normal' }],
+      [{ type: 'final_text', content: 'SECOND' }, { type: 'done', terminationReason: 'normal' }]] });
+    const cleanup = deferred<void>();
+    const original = h.agent.run.bind(h.agent);
+    vi.spyOn(h.agent, 'run').mockImplementation((opts) => {
+      const run = original(opts);
+      if (h.agent.runOptions.length === 1) run.reap = () => cleanup.promise;
+      return run;
+    });
+    await startTestBridge(h);
+    await h.channel.handlers.message?.(message('om_first', 'first'));
+    await waitFor(() => h.channel.sent.some(e => JSON.stringify(e.content).includes('FIRST')));
+    await h.channel.handlers.message?.(message('om_second', 'second'));
+    await new Promise(resolve => setTimeout(resolve, 800));
+    expect(h.agent.runOptions).toHaveLength(1);
+    cleanup.resolve();
+    await waitFor(() => h.channel.sent.some(e => JSON.stringify(e.content).includes('SECOND')));
+    expect(h.agent.runOptions).toHaveLength(2);
+    expect(JSON.stringify(h.channel.sent)).not.toContain('已有运行');
+  });
+
   it.each(['text', 'markdown', 'card'] as const)('keeps a session-start checkmark without a preparation message in %s mode', async (messageReply) => {
     const h = await createHarness({ messageReply, events: [[
       { type: 'system', threadId: 'thread_hook_ready' },

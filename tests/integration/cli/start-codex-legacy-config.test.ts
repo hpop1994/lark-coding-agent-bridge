@@ -47,6 +47,7 @@ describe('Codex startup compatibility with legacy binary metadata', () => {
       configPath: h.configPath,
     });
 
+    cleanups.push(() => agent.dispose?.() ?? Promise.resolve());
     await expect(
       agent.prepareRun?.({
         runId: 'run-1',
@@ -77,15 +78,16 @@ async function createLegacyCodexConfig(options: {
   const codex = join(binDir, 'codex');
   await writeFile(
     codex,
-    [
-      '#!/bin/sh',
-      'if [ "$1" = "--version" ]; then',
-      '  echo "codex-cli 999.0.0"',
-      '  exit 0',
-      'fi',
-      'exit 0',
-      '',
-    ].join('\n'),
+    `#!${process.execPath}
+const readline = require('node:readline');
+if (process.argv.includes('--version')) { console.log('codex-cli 999.0.0'); process.exit(0); }
+readline.createInterface({input:process.stdin}).on('line', line => {
+  const request = JSON.parse(line);
+  if (!request.id) return;
+  const result = request.method === 'initialize' ? {} : {thread:{id:'thread-1'},model:'test-model',instructionSources:[]};
+  console.log(JSON.stringify({id:request.id,result}));
+});
+`,
     'utf8',
   );
   await chmod(codex, 0o755);

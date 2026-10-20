@@ -50,7 +50,7 @@ import { canUseDm, canUseGroup, requireMentionForChat } from '../policy/access';
 import { MeetingManager } from '../meeting/manager';
 import type { VcRequestClient } from '../meeting/api';
 import { attachMeetingAgent, summarizeEndedMeeting } from '../meeting/orchestrator';
-import type { ScopeContext } from '../policy/run-policy';
+import { evaluateRunPolicy, type ScopeContext } from '../policy/run-policy';
 import { createOwnerRefreshController } from '../policy/owner';
 import { RunExecutor } from '../runtime/run-executor';
 import type { SessionCatalog } from '../session/catalog';
@@ -185,6 +185,7 @@ export interface StartChannelDeps {
 export async function startChannel(deps: StartChannelDeps): Promise<BridgeChannel> {
   const { cfg, agent, sessions, sessionCatalog, workspaces, controls } = deps;
   sessionCatalog?.resources.start();
+  if (sessionCatalog) sessionCatalog.resources.beforeEnd = (entry) => agent.endSession?.(entry.cwd) ?? Promise.resolve();
   const activeRuns = new ActiveRuns();
   // ChatModeCache stays per-bridge-instance — invalidated on restart along
   // with everything else. Topic-mode chats only need one chat.get() call ever.
@@ -313,6 +314,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
           sessionCatalog,
           workspaces,
           media,
+          pending,
           batch,
           controls,
           cotClient,
@@ -578,6 +580,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
           log.fail('disconnect', result.reason, { step: `flush-${idx}` });
         }
       }
+      await agent.dispose?.();
       if (disconnectResult.status === 'rejected') {
         throw disconnectResult.reason;
       }
@@ -837,6 +840,15 @@ interface RunBatchDeps {
   sessionCatalog?: SessionCatalog;
   workspaces: WorkspaceStore;
   media: MediaCache;
+  pending: PendingQueue;
+  steerTarget?: {
+    handle: RunHandle;
+    cwd: string;
+    fingerprint: string;
+    senderId: string;
+    modelSelection: string;
+    replyTarget: { replyTo: string };
+  };
   batch: NormalizedMessage[];
   controls: Controls;
   cotClient: CotClient;
@@ -847,7 +859,7 @@ interface RunBatchDeps {
   mode: ChatMode;
 }
 
-async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
+async function runAgentBatch(deps: RunBatchDeps): Promise<boolean | void> {
   const {
     channel,
     executor,
@@ -868,6 +880,9 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   const firstMsg = batch[0];
   const lastMsg = batch[batch.length - 1];
   if (!firstMsg || !lastMsg) return;
+  if (deps.steerTarget && (deps.steerTarget.handle.interrupted ||
+    batch.some((message) => message.senderId !== deps.steerTarget!.senderId) ||
+    normalizeModelSelection(controls.profileConfig.agentKind, controls.profileConfig.preferences.model) !== deps.steerTarget.modelSelection)) return false;
 
   const chatId = firstMsg.chatId;
   const threadId = firstMsg.threadId;
@@ -1002,6 +1017,33 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     controls.profileConfig.agentKind === 'codex'
       ? codexCapability(controls.profileConfig)
       : claudeCapability(controls.profileConfig);
+  if (deps.steerTarget) {
+    const target = deps.steerTarget;
+    const policy = evaluateRunPolicy({ scope: scopeContext, attachments: attachments.map(toPolicyAttachment),
+      prompt, requestedCwd: workspaces.cwdFor(scope) ?? controls.profileConfig.workspaces.default ?? '',
+      cwdRealpath: target.cwd, access: accessDecision, capability, profileConfig: controls.profileConfig,
+      now: Date.now(), codexHome: controls.profileConfig.codex?.codexHome,
+      inheritCodexHome: controls.profileConfig.codex?.inheritCodexHome });
+    if (!policy.ok) {
+      await channel.send(chatId, { markdown: policy.rejectReason.userVisible }, sendOpts);
+      return true;
+    }
+    if (policy.policyFingerprint !== target.fingerprint || target.handle.interrupted) return false;
+    try {
+      const accepted = await target.handle.run.steer!({ prompt,
+        images: attachments.filter((a) => a.kind === 'image' && a.decision === 'accepted').map((a) => a.path).filter((path): path is string => Boolean(path)),
+        messageId: lastMsg.messageId });
+      if (accepted) {
+        target.replyTarget.replyTo = lastMsg.messageId;
+        await addSessionPreparedReaction(channel, lastMsg.messageId);
+      }
+      return accepted;
+    } catch (error) {
+      log.fail('steer', error, { scope, messageId: lastMsg.messageId });
+      await channel.send(chatId, { markdown: `追加消息投递失败或结果不确定，未自动重发。\n${error instanceof Error ? error.message : String(error)}` }, sendOpts);
+      return true;
+    }
+  }
   let preparationReaction: Promise<string | undefined> | undefined;
   const markSessionStart = async (): Promise<void> => {
     preparationReaction ??= addWorkingReaction(channel, lastMsg.messageId);
@@ -1049,6 +1091,19 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   if (preparationReaction) void addSessionPreparedReaction(channel, lastMsg.messageId);
   activePolicyFingerprints.set(scope, flow.policy.policyFingerprint);
   const handle = execution.handle;
+  if (handle.run.steer) {
+    const steerTarget = { handle, cwd, fingerprint: flow.policy.policyFingerprint,
+      senderId: firstMsg.senderId, modelSelection, replyTarget: sendOpts };
+    deps.pending.setSteering(scope, async (messages) => {
+      try { return (await runAgentBatch({ ...deps, batch: messages, steerTarget })) === true; }
+      catch (error) {
+        log.fail('steer', error, { scope, step: 'prepare-input' });
+        await channel.send(chatId, { markdown: `追加消息未能完成处理，请检查后重发：${String(error)}` },
+          { ...sendOpts, replyTo: messages[messages.length - 1]!.messageId });
+        return true;
+      }
+    });
+  }
   const eventStream = execution.subscribe();
   if (flow.resumeFrom) {
     log.info('session', 'resume', { sessionId: flow.resumeFrom, cwd });
@@ -1336,6 +1391,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   } finally {
     activePolicyFingerprints.delete(scope);
     scheduleWorkingReactionCleanup(channel, lastMsg.messageId, reactionPromise);
+    await execution.waitForCompletion();
   }
 }
 
